@@ -1,59 +1,76 @@
 use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    self,
+    event::{DisableMouseCapture, EnableMouseCapture, KeyCode},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
-    io::{self, Stdout},
-    sync::{
-        mpsc::{self, Receiver},
-        Arc, Mutex,
-    },
+    env, error,
+    io::{self, Read},
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time,
 };
-use tui::widgets::canvas::Canvas;
-use tui::Frame;
 use tui::{
-    backend::Backend,
-    widgets::{Block, Borders},
-    Terminal,
+    backend::{Backend, CrosstermBackend},
+    layout::{self, Constraint, Layout},
+    style::Color,
+    symbols::Marker,
+    widgets::{
+        canvas::{Canvas, Points},
+        Block, Borders,
+    },
+    Frame, Terminal,
 };
-use tui::{backend::CrosstermBackend, layout::Layout};
 
-fn main() {}
+fn main() -> Result<(), io::Error> {
+    // Read the entire CHIP-8 file into memory.
+    let args: Vec<String> = env::args().collect();
+    let filename = &args[1];
+    let mut rom = vec![];
+    {
+        let mut file = std::fs::File::open(filename)?;
+        file.read_to_end(&mut rom)?;
+    }
+
+    // Set up emulator and UI.
+    let (tx, rx) = mpsc::channel();
+    let mut emulator = Emulator::new(tx, time::Duration::from_millis(10));
+    emulator.load(&rom).expect("could not load ROM");
+    let mut ui = UI::new(rx);
+
+    thread::spawn(move || {
+        emulator.run().expect("emulator crashed");
+    });
+    ui.run();
+
+    Ok(())
+}
 
 struct Emulator {
     pc: usize,
-    mem: [u8; 4096],
-    pixels: Pixels,
+    mem: [u8; 0x1000],
+    updates: mpsc::Sender<Update>,
+    poll_timeout: time::Duration,
+    display: Display,
     idx_reg: usize,
-    registers: [u8; 16],
+    registers: [u8; 0x10],
     stack: Vec<u16>,
     delay_timer: Timer,
     sound_timer: Timer,
 }
 
 impl Emulator {
-    fn new(delay_timer: Timer, sound_timer: Timer) -> Self {
+    fn new(tx: mpsc::Sender<Update>, poll_timeout: time::Duration) -> Self {
+        let mut mem = [0; 0x1000];
+        mem.write(0x100, &FONT_DATA).unwrap(); // Start at 0x200.
         Self {
-            pc: 512,
-            mem: [0; 4096],
-            pixels: Pixels::new(),
+            pc: 0x200,
+            mem,
+            poll_timeout,
+            updates: tx.clone(),
+            display: Display::new(tx),
             idx_reg: 0,
-            registers: [0; 16],
-            stack: vec![],
-            delay_timer,
-            sound_timer,
-        }
-    }
-
-    fn new_with_defaults() -> Self {
-        Self {
-            pc: 512,
-            mem: [0; 4096],
-            pixels: Pixels::new(),
-            idx_reg: 0,
-            registers: [0; 16],
+            registers: [0; 0x10],
             stack: vec![],
             delay_timer: Timer::new(0, TIMER_INTERVAL),
             sound_timer: Timer::new(0, TIMER_INTERVAL),
@@ -61,47 +78,62 @@ impl Emulator {
     }
 
     fn load(&mut self, rom: &[u8]) -> Result<(), ErrMemory> {
-        if rom.len() > 4096 - 512 {
+        if rom.len() > 0x1000 - 0x200 {
             Err(ErrMemory::Overflow)
         } else {
-            self.mem[512..512 + rom.len()].copy_from_slice(rom);
+            self.mem[0x200..0x200 + rom.len()].copy_from_slice(rom);
             Ok(())
         }
     }
 
-    fn fetch_next_and_decode(&mut self) -> Command {
-        if let [a, b] = *self.mem.read(self.pc, 2).unwrap() {
+    fn fetch_next_and_decode(&mut self) -> Result<Command, ErrMemory> {
+        if let [a, b] = *self.mem.read(self.pc, 2)? {
             self.pc += 2;
             let i: u16 = (0 | a as u16) << 8 | b as u16;
-            Command::from(i)
+            Ok(Command::from(i))
         } else {
+            // This should never happen.
             panic!()
         }
     }
 
-    fn start(&mut self) {
+    fn run(&mut self) -> Result<(), Box<dyn error::Error>> {
         loop {
-            let next = self.fetch_next_and_decode();
+            let next = self
+                .fetch_next_and_decode()
+                .expect("could not decode next instruction");
             self.exec(next);
+
+            if crossterm::event::poll(self.poll_timeout)? {
+                if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            self.updates.send(Update::Exit)?;
+                            break;
+                        }
+                        _ => (),
+                    }
+                }
+            }
         }
+
+        Ok(())
     }
 
     fn exec(&mut self, cmd: Command) {
         match cmd {
-            Command::Clear => self.pixels.clear(),
+            Command::Clear => self.display.clear(),
             Command::Jump(addr) => self.pc = addr,
             Command::Set(reg, val) => self.registers[reg] = val,
             Command::Add(reg, val) => self.registers[reg] += val,
             Command::SetIdx(v) => self.idx_reg = v,
-            Command::Display(x, y, n) => {
-                let i = self.registers[x] as usize;
-                let j = self.registers[y] as usize;
+            Command::Display { x, y, height: n } => {
+                let i = self.registers[y] as usize;
+                let j = self.registers[x] as usize;
                 let sprite = self.mem.read(self.idx_reg, n).unwrap();
-                if self.pixels.draw_sprite(i, j, sprite) {
-                    self.registers[15] = 1;
-                } else {
-                    self.registers[15] = 0;
-                }
+
+                let is_px_turned_off = self.display.draw_sprite(i, j, sprite);
+                self.registers[0xF] = if is_px_turned_off { 1 } else { 0 };
             }
             _ => (),
         }
@@ -110,10 +142,16 @@ impl Emulator {
 
 #[cfg(test)]
 mod test_emulator {
-    use crate::{split_u16_into_bytes, Command, Emulator, ErrMemory, UI};
+    use crate::{split_u16_into_bytes, Command, Emulator, ErrMemory};
+    use std::sync::mpsc;
+    use std::time;
 
+    /// Convenience method to initalize things for testing.
     fn init() -> (Emulator, Vec<u16>, Vec<u8>) {
-        let emu = Emulator::new_with_defaults();
+        let (tx, _) = mpsc::channel();
+        let emu = Emulator::new(tx, time::Duration::MAX);
+
+        // Create some dummy instructions.
         let instructions: Vec<u16> = vec![0x00E0, 0x61AB, 0x7101, 0xA123];
         let instructions_in_bytes: Vec<u8> = instructions
             .iter()
@@ -129,9 +167,9 @@ mod test_emulator {
     fn test_load_rom() {
         let (mut emu, _, bytes) = init();
         emu.load(&bytes[..]).unwrap();
-        assert_eq!(&emu.mem[512..512 + bytes.len()], bytes);
+        assert_eq!(&emu.mem[0x200..0x200 + bytes.len()], bytes);
 
-        let too_many = [0; 4096];
+        let too_many = [0; 0x1000];
         let got = emu.load(&too_many);
         assert!(got.is_err());
         assert_eq!(got.unwrap_err(), ErrMemory::Overflow);
@@ -140,15 +178,12 @@ mod test_emulator {
     #[test]
     fn fetch_and_decode() {
         let (mut emu, instructions, instructions_in_bytes) = init();
-        let test_commands: Vec<Command> = instructions
-            .iter()
-            .map(|x| Command::from(x.clone()))
-            .collect();
+        let test_commands: Vec<Command> = instructions.iter().map(|x| Command::from(*x)).collect();
 
         emu.load(&instructions_in_bytes[..]).unwrap();
 
         for cmd in test_commands {
-            assert_eq!(emu.fetch_next_and_decode(), cmd);
+            assert_eq!(emu.fetch_next_and_decode().unwrap(), cmd);
         }
     }
 }
@@ -198,7 +233,7 @@ enum Command {
     Set(usize, u8),
     Add(usize, u8),
     SetIdx(usize),
-    Display(usize, usize, usize),
+    Display { x: usize, y: usize, height: usize },
 }
 
 impl Command {
@@ -216,7 +251,7 @@ impl Command {
             6 => Command::Set(x, nn),
             7 => Command::Add(x, nn),
             0xA => Command::SetIdx(nnn),
-            0xD => Command::Display(x, y, n),
+            0xD => Command::Display { x, y, height: n },
             _ => Command::Nop,
         }
     }
@@ -234,7 +269,14 @@ mod test_command {
             (0x6ABC, Command::Set(0xA, 0xBC)),
             (0x7ABC, Command::Add(0xA, 0xBC)),
             (0xAABC, Command::SetIdx(0xABC)),
-            (0xDABC, Command::Display(0xA, 0xB, 0xC)),
+            (
+                0xDABC,
+                Command::Display {
+                    x: 0xA,
+                    y: 0xB,
+                    height: 0xC,
+                },
+            ),
             (0x2222, Command::Nop),
         ];
         for test in tests {
@@ -277,7 +319,7 @@ impl Memory for [u8] {
     }
 }
 
-const MEM_SIZE: usize = 4096;
+const MEM_SIZE: usize = 0x1000;
 
 const FONT_DATA: [u8; 80] = [
     0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
@@ -304,7 +346,7 @@ mod test_array_mem {
 
     #[test]
     fn can_read_and_write() {
-        let mut m: [u8; 4096] = [0; 4096];
+        let mut m: [u8; 0x1000] = [0; 0x1000];
         let tests = vec![
             (0, vec![0, 1, 2]),
             (0, vec![1, 2, 3]),
@@ -320,18 +362,18 @@ mod test_array_mem {
 
     #[test]
     fn set_invalid_index() {
-        let mut m: [u8; 4096] = [0; 4096];
-        assert!(m.write(4096, &[]).is_ok());
-        assert!(m.write(4097, &[]).is_ok());
-        assert_eq!(m.write(4097, &[0]).unwrap_err(), ErrMemory::Overflow);
+        let mut m: [u8; 0x1000] = [0; 0x1000];
+        assert!(m.write(0x1000, &[]).is_ok());
+        assert!(m.write(0x1001, &[]).is_ok());
+        assert_eq!(m.write(0x1001, &[0]).unwrap_err(), ErrMemory::Overflow);
     }
 
     #[test]
     fn get_invalid_index() {
-        let m: [u8; 4096] = [0; 4096];
-        assert!(m.read(4096, 0).is_ok());
-        assert!(m.read(4097, 0).is_ok());
-        assert_eq!(m.read(4097, 1).unwrap_err(), ErrMemory::Overflow);
+        let m: [u8; 0x1000] = [0; 0x1000];
+        assert!(m.read(0x1000, 0).is_ok());
+        assert!(m.read(0x1001, 0).is_ok());
+        assert_eq!(m.read(0x1001, 1).unwrap_err(), ErrMemory::Overflow);
     }
 }
 
@@ -341,7 +383,7 @@ struct Timer {
 }
 
 impl Timer {
-    fn new(init: u8, per_tick: time::Duration) -> Self {
+    fn new(init: u8, period: time::Duration) -> Self {
         let val = Arc::new(Mutex::new(init));
         let val_c = Arc::clone(&val);
         let ticker = thread::spawn(move || loop {
@@ -352,7 +394,7 @@ impl Timer {
                     x => *val = x - 1,
                 }
             }
-            thread::sleep(per_tick);
+            thread::sleep(period);
         });
         Self { val, ticker }
     }
@@ -366,6 +408,7 @@ impl Timer {
     }
 }
 
+/// Period corresponding to 60 Hz.
 const TIMER_INTERVAL: time::Duration = time::Duration::from_nanos(16_666_666);
 
 #[cfg(test)]
@@ -389,13 +432,17 @@ mod test_timer {
     }
 }
 
-struct Pixels {
-    pixels: Arc<Mutex<[bool; 64 * 32]>>,
+type Pixels = Arc<Mutex<[bool; 64 * 32]>>;
+
+struct Display {
+    pixels: Pixels,
+    updates: mpsc::Sender<Update>,
 }
 
-impl Pixels {
-    fn new() -> Self {
+impl Display {
+    fn new(tx: mpsc::Sender<Update>) -> Self {
         Self {
+            updates: tx,
             pixels: Arc::new(Mutex::new([false; 64 * 32])),
         }
     }
@@ -410,14 +457,13 @@ impl Pixels {
 
     /// Flips the pixel at coordinate given and returns the old value, if any. If the coordinate is
     /// off the screen then this is a noop.
-    fn flip(&mut self, i: usize, j: usize) -> Result<bool, ()> {
+    fn flip(&self, i: usize, j: usize, pixels: &mut [bool; 64 * 32]) -> Option<bool> {
         if i >= 32 || j >= 64 {
-            return Err(());
+            return None;
         }
-        let mut pixels = self.pixels.lock().unwrap();
         let old = pixels[i * 64 + j];
         pixels[i * 64 + j] = !old;
-        Ok(old)
+        Some(old)
     }
 
     /// Draws a sprite at the coordinate given. Only the starting coordinate wraps around, and all
@@ -427,19 +473,27 @@ impl Pixels {
         let mut i = i % 32;
         let j = j % 64;
         let mut flag = false;
-        for byte in sprite {
-            let bits = split_u8_into_bits(*byte);
-            for d in 0..8 {
-                if bits[d] == false {
-                    continue;
+
+        {
+            let mut pixels = self.pixels.lock().unwrap();
+            for byte in sprite {
+                let bits = split_u8_into_bits(*byte);
+                for d in 0..8 {
+                    if bits[d] == false {
+                        continue;
+                    }
+                    match self.flip(i, j + d, &mut pixels) {
+                        Some(old) if old == false => flag = true,
+                        _ => (),
+                    }
                 }
-                match self.flip(i, j + d) {
-                    Ok(old) if old == false => flag = true,
-                    _ => (),
-                }
+                i += 1;
             }
-            i += 1;
         }
+
+        self.updates
+            .send(Update::Display(self.pixels.clone()))
+            .unwrap();
         flag
     }
 
@@ -453,18 +507,21 @@ impl Pixels {
 
 #[cfg(test)]
 mod test_pixels {
-    use crate::Pixels;
+    use crate::Display;
     use rand::prelude::*;
+    use std::sync::mpsc;
 
     #[test]
     fn can_set_out_of_screen() {
-        let mut pxs = Pixels::new();
+        let (tx, _) = mpsc::channel();
+        let mut pxs = Display::new(tx);
         pxs.set(33, 65);
     }
 
     #[test]
     fn clear() {
-        let mut pxs = Pixels::new();
+        let (tx, _) = mpsc::channel();
+        let mut pxs = Display::new(tx);
         let mut rng = thread_rng();
         for _ in 0..64 {
             let i = rng.gen_range(0..32);
@@ -478,13 +535,20 @@ mod test_pixels {
     }
 }
 
+enum Update {
+    Nop,
+    Exit,
+    Log(String),
+    Display(Pixels),
+}
+
 struct UI {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    updates: Receiver<Arc<Mutex<[bool; 64 * 32]>>>,
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    updates: mpsc::Receiver<Update>,
 }
 
 impl UI {
-    fn new(rx: Receiver<Arc<Mutex<[bool; 64 * 32]>>>) -> Self {
+    fn new(rx: mpsc::Receiver<Update>) -> Self {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).unwrap();
@@ -495,35 +559,83 @@ impl UI {
         }
     }
 
-    fn start(&mut self) {
-        enable_raw_mode().unwrap();
+    fn run(&mut self) {
+        terminal::enable_raw_mode().unwrap();
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).unwrap();
+        crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture).unwrap();
 
         loop {
-            match self.updates.recv() {
-                Ok(pxs) => {
+            let update = self.updates.recv();
+            if update.is_err() {
+                break;
+            }
+            match update.unwrap_or(Update::Nop) {
+                Update::Display(pxs) => {
                     self.terminal
                         .draw(|f| {
                             ui(f, pxs);
                         })
                         .unwrap();
                 }
-                _ => break,
+                Update::Exit => break,
+                _ => (),
             }
         }
 
-        disable_raw_mode().unwrap();
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen).unwrap();
+        terminal::disable_raw_mode().unwrap();
+        crossterm::execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )
+        .unwrap();
         self.terminal.show_cursor().unwrap();
     }
 }
 
 fn ui<B: Backend>(f: &mut Frame<B>, pixels: Arc<Mutex<[bool; 64 * 32]>>) {
-    let bg = Layout::default();
-    let canvas = Canvas::default()
+    let screen = Layout::default()
+        .direction(layout::Direction::Vertical)
+        .constraints(
+            [
+                layout::Constraint::Percentage(50),
+                layout::Constraint::Percentage(50),
+            ]
+            .as_ref(),
+        )
+        .split(f.size());
+
+    let top = screen[0];
+    let bot = screen[1];
+
+    let main_screen = Canvas::default()
         .block(Block::default().borders(Borders::ALL).title("CHIP-8"))
-        .x_bounds([-180.0, 180.0])
-        .y_bounds([-90.0, 90.0])
-        .paint(|ctx| {});
+        .marker(Marker::Block)
+        .x_bounds([0.0, 64.0])
+        .y_bounds([0.0, 32.0])
+        .paint(|ctx| {
+            let mut coords: Vec<(f64, f64)> = vec![];
+            {
+                let pixels = pixels.lock().unwrap();
+                coords = pixels.iter().enumerate().fold(coords, |mut accum, px| {
+                    if *px.1 {
+                        let x = px.0 % 64;
+                        let y = 32 - px.0 / 64; // tui-rs takes (0, 0) to be bottom-left
+                        accum.push((x as f64, y as f64));
+                    }
+                    accum
+                });
+            }
+            ctx.draw(&Points {
+                coords: &coords[..],
+                color: Color::White,
+            })
+        });
+
+    let top = Layout::default()
+        .direction(layout::Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(top);
+
+    f.render_widget(main_screen, top[0]);
 }
