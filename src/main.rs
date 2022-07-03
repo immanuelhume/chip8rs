@@ -1,6 +1,6 @@
 use crossterm::{
     self,
-    event::{DisableMouseCapture, EnableMouseCapture, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
@@ -54,7 +54,7 @@ struct Emulator {
     display: Display,
     idx_reg: usize,
     registers: [u8; 0x10],
-    stack: Vec<u16>,
+    stack: Vec<usize>,
     delay_timer: Timer,
     sound_timer: Timer,
 }
@@ -62,7 +62,7 @@ struct Emulator {
 impl Emulator {
     fn new(tx: mpsc::Sender<Update>, poll_timeout: time::Duration) -> Self {
         let mut mem = [0; 0x1000];
-        mem.write(0x100, &FONT_DATA).unwrap(); // Start at 0x200.
+        mem.write(0x100, &FONT_DATA).unwrap(); // Write font sprits to 0x100.
         Self {
             pc: 0x200,
             mem,
@@ -104,10 +104,10 @@ impl Emulator {
                 .expect("could not decode next instruction");
             self.exec(next);
 
-            if crossterm::event::poll(self.poll_timeout)? {
-                if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
+            if event::poll(self.poll_timeout)? {
+                if let event::Event::Key(key) = event::read()? {
                     match key.code {
-                        KeyCode::Char('q') => {
+                        KeyCode::Char('k') => {
                             self.updates.send(Update::Exit)?;
                             break;
                         }
@@ -115,6 +115,8 @@ impl Emulator {
                     }
                 }
             }
+
+            thread::sleep(EMULATOR_INTERVAL);
         }
 
         Ok(())
@@ -124,9 +126,66 @@ impl Emulator {
         match cmd {
             Command::Clear => self.display.clear(),
             Command::Jump(addr) => self.pc = addr,
+            Command::SubroutinePush(addr) => {
+                self.stack.push(self.pc);
+                self.pc = addr;
+            }
+            Command::SubroutinePop => {
+                self.pc = self.stack.pop().unwrap();
+            }
+            Command::SkipEqI(reg, val) => {
+                if self.registers[reg] == val {
+                    self.pc += 2;
+                }
+            }
+            Command::SkipNeqI(reg, val) => {
+                if self.registers[reg] != val {
+                    self.pc += 2;
+                }
+            }
+            Command::SkipEq(reg1, reg2) => {
+                if self.registers[reg1] == self.registers[reg2] {
+                    self.pc += 2;
+                }
+            }
+            Command::SkipNeq(reg1, reg2) => {
+                if self.registers[reg1] != self.registers[reg2] {
+                    self.pc += 2;
+                }
+            }
+            Command::Arithmetic(op) => match op {
+                Operation::Set(x, y) => self.registers[x] = self.registers[y],
+                Operation::Or(x, y) => self.registers[x] |= self.registers[y],
+                Operation::And(x, y) => self.registers[x] &= self.registers[y],
+                Operation::Xor(x, y) => self.registers[x] ^= self.registers[y],
+                Operation::Add(x, y) => {
+                    let (res, overflow) = self.registers[x].overflowing_add(self.registers[y]);
+                    self.registers[x] = res;
+                    if overflow {
+                        self.registers[0xF] = 1;
+                    }
+                }
+                Operation::Sub(x, y) => {
+                    let (res, overflow) = self.registers[x].overflowing_sub(self.registers[y]);
+                    self.registers[x] = res;
+                    self.registers[0xF] = if overflow { 0 } else { 1 };
+                }
+                Operation::ShiftR(x, y) => {
+                    let a = self.registers[y];
+                    self.registers[0xF] = a & 1;
+                    self.registers[x] = a >> 1;
+                }
+                Operation::ShiftL(x, y) => {
+                    let a = self.registers[y];
+                    self.registers[0xF] = a & 0x80;
+                    self.registers[x] = a << 1;
+                }
+            },
             Command::Set(reg, val) => self.registers[reg] = val,
             Command::Add(reg, val) => self.registers[reg] += val,
             Command::SetIdx(v) => self.idx_reg = v,
+            Command::JumpX(addr) => self.pc = self.registers[0] as usize + addr,
+            Command::Random(reg, val) => self.registers[reg] = rand::random::<u8>() & val,
             Command::Display { x, y, height: n } => {
                 let i = self.registers[y] as usize;
                 let j = self.registers[x] as usize;
@@ -135,10 +194,73 @@ impl Emulator {
                 let is_px_turned_off = self.display.draw_sprite(i, j, sprite);
                 self.registers[0xF] = if is_px_turned_off { 1 } else { 0 };
             }
+            Command::SkipOnKey(x) => {
+                if event::poll(self.poll_timeout).unwrap() {
+                    if let Event::Key(key) = event::read().unwrap() {
+                        if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
+                            self.pc += 2;
+                        }
+                    }
+                }
+            }
+            Command::SkipOffKey(x) => {
+                if event::poll(self.poll_timeout).unwrap() {
+                    if let Event::Key(key) = event::read().unwrap() {
+                        if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
+                            self.pc -= 2; // dumb trick
+                        }
+                    }
+                }
+                self.pc += 2;
+            }
+            Command::ReadDelay(x) => self.registers[x] = self.delay_timer.get(),
+            Command::SetDelay(x) => self.delay_timer.set(self.registers[x]),
+            Command::SetSound(x) => self.sound_timer.set(self.registers[x]),
+            Command::AddIdx(x) => {
+                let a = self.idx_reg;
+                let sum = a + self.registers[x] as usize;
+                if sum > 0x0FFF && a <= 0x0FFF {
+                    self.registers[0xF] = 1;
+                }
+                self.idx_reg = sum;
+            }
+            Command::GetKey(x) => loop {
+                if let Event::Key(key) = event::read().unwrap() {
+                    if let KeyCode::Char(c) = key.code {
+                        match KEY_MAP.iter().position(|x| *x == c) {
+                            Some(i) => {
+                                self.registers[x] = i as u8;
+                                break;
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            },
+            Command::FontChar(x) => self.idx_reg = 0x100 + (self.registers[x] & 0x0F) as usize,
+            Command::BCD(x) => {
+                let mut a = self.registers[x];
+                for i in 0..3 {
+                    self.mem.write(self.idx_reg + i, &[a % 10]).unwrap();
+                    a /= 10;
+                }
+            }
+            Command::StoreMem(x) => self
+                .mem
+                .write(self.idx_reg, &self.registers[0..=x])
+                .unwrap(),
+            Command::ReadMem(x) => {
+                self.registers[0..=x].copy_from_slice(&self.mem.read(self.idx_reg, x + 1).unwrap())
+            }
             _ => (),
         }
     }
 }
+
+/// Maps a hexadecimal digit (index in the array) to the corresponding keycode.
+const KEY_MAP: [char; 16] = [
+    'x', '1', '2', '3', 'q', 'w', 'e', 'a', 's', 'd', 'z', 'c', '4', 'r', 'f', 'v',
+];
 
 #[cfg(test)]
 mod test_emulator {
@@ -227,13 +349,54 @@ fn test_split_u8_into_bits() {
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    Nop,
-    Clear,
-    Jump(usize),
-    Set(usize, u8),
-    Add(usize, u8),
-    SetIdx(usize),
-    Display { x: usize, y: usize, height: usize },
+    Nop,   // just to be safe
+    Clear, // 0x00E0
+
+    Jump(usize),           // 0x1NNN
+    SubroutinePush(usize), // 0x2NNN
+    SubroutinePop,         // 0x00EE
+
+    SkipEqI(usize, u8),    // 0x3XNN
+    SkipNeqI(usize, u8),   // 0x4XNN
+    SkipEq(usize, usize),  // 0x5XY0
+    SkipNeq(usize, usize), // 0x9XY0
+
+    Set(usize, u8), // 0x6XNN
+    Add(usize, u8), // 0x7XNN
+
+    Arithmetic(Operation), // a bunch
+
+    SetIdx(usize),                                 // 0xANNN
+    JumpX(usize),                                  // 0xBNNN
+    Random(usize, u8),                             // 0xCXNN
+    Display { x: usize, y: usize, height: usize }, // 0xDXYN
+
+    SkipOnKey(usize),  // 0xEX9E
+    SkipOffKey(usize), // 0xEXA1
+
+    ReadDelay(usize), // 0xFX07
+    SetDelay(usize),  // 0xFX15
+    SetSound(usize),  // 0xFX18
+
+    AddIdx(usize),   // 0xFX1E
+    GetKey(usize),   // 0xFX0A
+    FontChar(usize), // 0xFX29
+    BCD(usize),      // 0xFX33
+
+    StoreMem(usize), // 0xFX55
+    ReadMem(usize),  // 0xFX65
+}
+
+#[derive(Debug, PartialEq)]
+enum Operation {
+    Set(usize, usize),    // 0x8XY0
+    Or(usize, usize),     // 0x8XY1
+    And(usize, usize),    // 0x8XY2
+    Xor(usize, usize),    // 0x8XY3
+    Add(usize, usize),    // 0x8XY4
+    Sub(usize, usize),    // 0x8XY5, 0x8XY7
+    ShiftL(usize, usize), // 0x8XY6
+    ShiftR(usize, usize), // 0x8XYE
 }
 
 impl Command {
@@ -246,12 +409,52 @@ impl Command {
         let nnn = (i & 0x0FFF) as usize;
 
         match opcode {
-            0 => Command::Clear,
-            1 => Command::Jump(nnn),
-            6 => Command::Set(x, nn),
-            7 => Command::Add(x, nn),
+            0x0 => match n {
+                0x0 => Command::Clear,
+                0xE => Command::SubroutinePop,
+                _ => Command::Nop,
+            },
+            0x1 => Command::Jump(nnn),
+            0x2 => Command::SubroutinePush(nnn),
+            0x3 => Command::SkipEqI(x, nn),
+            0x4 => Command::SkipNeqI(x, nn),
+            0x5 => Command::SkipEq(x, y),
+            0x6 => Command::Set(x, nn),
+            0x7 => Command::Add(x, nn),
+            0x8 => match n {
+                0x0 => Command::Arithmetic(Operation::Set(x, y)),
+                0x1 => Command::Arithmetic(Operation::Or(x, y)),
+                0x2 => Command::Arithmetic(Operation::And(x, y)),
+                0x3 => Command::Arithmetic(Operation::Xor(x, y)),
+                0x4 => Command::Arithmetic(Operation::Add(x, y)),
+                0x5 => Command::Arithmetic(Operation::Sub(x, y)),
+                0x7 => Command::Arithmetic(Operation::Sub(y, x)),
+                0x6 => Command::Arithmetic(Operation::ShiftR(x, y)),
+                0xE => Command::Arithmetic(Operation::ShiftL(x, y)),
+                _ => Command::Nop,
+            },
+            0x9 => Command::SkipNeq(x, y),
             0xA => Command::SetIdx(nnn),
+            0xB => Command::JumpX(nnn),
+            0xC => Command::Random(x, nn),
             0xD => Command::Display { x, y, height: n },
+            0xE => match nn {
+                0x9E => Command::SkipOnKey(x),
+                0xA1 => Command::SkipOffKey(x),
+                _ => Command::Nop,
+            },
+            0xF => match nn {
+                0x07 => Command::ReadDelay(x),
+                0x15 => Command::SetDelay(x),
+                0x18 => Command::SetSound(x),
+                0x1E => Command::AddIdx(x),
+                0x0A => Command::GetKey(x),
+                0x29 => Command::FontChar(x),
+                0x33 => Command::BCD(x),
+                0x55 => Command::StoreMem(x),
+                0x65 => Command::ReadMem(x),
+                _ => Command::Nop,
+            },
             _ => Command::Nop,
         }
     }
@@ -259,16 +462,33 @@ impl Command {
 
 #[cfg(test)]
 mod test_command {
-    use crate::Command;
+    use crate::{Command, Operation};
 
     #[test]
-    fn create_from_instruction() {
+    fn decode() {
         let tests = vec![
             (0x00E0, Command::Clear),
             (0x1ABC, Command::Jump(0xABC)),
+            (0x2ABC, Command::SubroutinePush(0xABC)),
+            (0x00EE, Command::SubroutinePop),
+            (0x3ABC, Command::SkipEqI(0xA, 0xBC)),
+            (0x4ABC, Command::SkipNeqI(0xA, 0xBC)),
+            (0x5AB0, Command::SkipEq(0xA, 0xB)),
+            (0x9AB0, Command::SkipNeq(0xA, 0xB)),
             (0x6ABC, Command::Set(0xA, 0xBC)),
             (0x7ABC, Command::Add(0xA, 0xBC)),
+            (0x8AB0, Command::Arithmetic(Operation::Set(0xA, 0xB))),
+            (0x8AB1, Command::Arithmetic(Operation::Or(0xA, 0xB))),
+            (0x8AB2, Command::Arithmetic(Operation::And(0xA, 0xB))),
+            (0x8AB3, Command::Arithmetic(Operation::Xor(0xA, 0xB))),
+            (0x8AB4, Command::Arithmetic(Operation::Add(0xA, 0xB))),
+            (0x8AB5, Command::Arithmetic(Operation::Sub(0xA, 0xB))),
+            (0x8AB7, Command::Arithmetic(Operation::Sub(0xB, 0xA))),
+            (0x8AB6, Command::Arithmetic(Operation::ShiftR(0xA, 0xB))),
+            (0x8ABE, Command::Arithmetic(Operation::ShiftL(0xA, 0xB))),
             (0xAABC, Command::SetIdx(0xABC)),
+            (0xBABC, Command::JumpX(0xABC)),
+            (0xCABC, Command::Random(0xA, 0xBC)),
             (
                 0xDABC,
                 Command::Display {
@@ -277,7 +497,17 @@ mod test_command {
                     height: 0xC,
                 },
             ),
-            (0x2222, Command::Nop),
+            (0xEA9E, Command::SkipOnKey(0xA)),
+            (0xEAA1, Command::SkipOffKey(0xA)),
+            (0xFA07, Command::ReadDelay(0xA)),
+            (0xFA15, Command::SetDelay(0xA)),
+            (0xFA18, Command::SetSound(0xA)),
+            (0xFA1E, Command::AddIdx(0xA)),
+            (0xFA0A, Command::GetKey(0xA)),
+            (0xFA29, Command::FontChar(0xA)),
+            (0xFA33, Command::BCD(0xA)),
+            (0xFA55, Command::StoreMem(0xA)),
+            (0xFA65, Command::ReadMem(0xA)),
         ];
         for test in tests {
             assert_eq!(Command::from(test.0), test.1);
@@ -410,6 +640,9 @@ impl Timer {
 
 /// Period corresponding to 60 Hz.
 const TIMER_INTERVAL: time::Duration = time::Duration::from_nanos(16_666_666);
+
+/// Period corresponding to 600 Hz.
+const EMULATOR_INTERVAL: time::Duration = time::Duration::from_nanos(1_666_666);
 
 #[cfg(test)]
 mod test_timer {
