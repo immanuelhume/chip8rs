@@ -6,7 +6,10 @@ use crossterm::{
 use std::{
     env, error,
     io::{self, Read},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        mpsc::{self, TryRecvError},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time,
 };
@@ -36,7 +39,7 @@ fn main() -> Result<(), io::Error> {
     let (tx, rx) = mpsc::channel();
     let mut emulator = Emulator::new(tx, time::Duration::from_millis(10));
     emulator.load(&rom).expect("could not load ROM");
-    let mut ui = UI::new(rx);
+    let mut ui = UI::new(rx, emulator.display.pixels.clone());
 
     thread::spawn(move || {
         emulator.run().expect("emulator crashed");
@@ -707,26 +710,21 @@ impl Display {
         let j = j % 64;
         let mut flag = false;
 
-        {
-            let mut pixels = self.pixels.lock().unwrap();
-            for byte in sprite {
-                let bits = split_u8_into_bits(*byte);
-                for d in 0..8 {
-                    if bits[d] == false {
-                        continue;
-                    }
-                    match self.flip(i, j + d, &mut pixels) {
-                        Some(old) if old == false => flag = true,
-                        _ => (),
-                    }
+        let mut pixels = self.pixels.lock().unwrap();
+        for byte in sprite {
+            let bits = split_u8_into_bits(*byte);
+            for d in 0..8 {
+                if bits[d] == false {
+                    continue;
                 }
-                i += 1;
+                match self.flip(i, j + d, &mut pixels) {
+                    Some(old) if old == false => flag = true,
+                    _ => (),
+                }
             }
+            i += 1;
         }
 
-        self.updates
-            .send(Update::Display(self.pixels.clone()))
-            .unwrap();
         flag
     }
 
@@ -772,16 +770,16 @@ enum Update {
     Nop,
     Exit,
     Log(String),
-    Display(Pixels),
 }
 
 struct UI {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    pixels: Pixels,
     updates: mpsc::Receiver<Update>,
 }
 
 impl UI {
-    fn new(rx: mpsc::Receiver<Update>) -> Self {
+    fn new(rx: mpsc::Receiver<Update>, pixels: Pixels) -> Self {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).unwrap();
@@ -789,6 +787,7 @@ impl UI {
         Self {
             terminal,
             updates: rx,
+            pixels,
         }
     }
 
@@ -798,21 +797,15 @@ impl UI {
         crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture).unwrap();
 
         loop {
-            let update = self.updates.recv();
-            if update.is_err() {
-                break;
-            }
-            match update.unwrap_or(Update::Nop) {
-                Update::Display(pxs) => {
-                    self.terminal
-                        .draw(|f| {
-                            ui(f, pxs);
-                        })
-                        .unwrap();
-                }
-                Update::Exit => break,
+            match self.updates.try_recv() {
+                Ok(Update::Exit) | Err(TryRecvError::Disconnected) => break,
                 _ => (),
             }
+            self.terminal
+                .draw(|f| {
+                    ui(f, self.pixels.clone());
+                })
+                .unwrap();
         }
 
         terminal::disable_raw_mode().unwrap();
