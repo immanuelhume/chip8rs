@@ -4,7 +4,7 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::{
-    env, error,
+    env, error, fmt,
     io::{self, Read},
     sync::{
         mpsc::{self, TryRecvError},
@@ -17,10 +17,12 @@ use tui::{
     backend::{Backend, CrosstermBackend},
     layout::{self, Constraint, Layout},
     style::Color,
+    style::{Modifier, Style},
     symbols::Marker,
+    text::{Span, Spans, Text},
     widgets::{
         canvas::{Canvas, Points},
-        Block, Borders,
+        Block, Borders, List, ListItem, ListState,
     },
     Frame, Terminal,
 };
@@ -39,7 +41,16 @@ fn main() -> Result<(), io::Error> {
     let (tx, rx) = mpsc::channel();
     let mut emulator = Emulator::new(tx, time::Duration::from_millis(10));
     emulator.load(&rom).expect("could not load ROM");
-    let mut ui = UI::new(rx, emulator.display.pixels.clone());
+    let cmds = rom
+        .iter()
+        .fold(vec![], |mut accum, byte| {
+            accum.push((0 | *byte as u16) << 8 | *byte as u16);
+            accum
+        })
+        .iter()
+        .map(|instruction| Command::from(*instruction))
+        .collect();
+    let mut ui = UI::new(rx, emulator.screen.pixels.clone(), cmds);
 
     thread::spawn(move || {
         emulator.run().expect("emulator crashed");
@@ -54,7 +65,7 @@ struct Emulator {
     mem: [u8; 0x1000],
     updates: mpsc::Sender<Update>,
     poll_timeout: time::Duration,
-    display: Display,
+    screen: Screen,
     idx_reg: usize,
     registers: [u8; 0x10],
     stack: Vec<usize>,
@@ -71,7 +82,7 @@ impl Emulator {
             mem,
             poll_timeout,
             updates: tx.clone(),
-            display: Display::new(tx),
+            screen: Screen::new(tx),
             idx_reg: 0,
             registers: [0; 0x10],
             stack: vec![],
@@ -102,9 +113,7 @@ impl Emulator {
 
     fn run(&mut self) -> Result<(), Box<dyn error::Error>> {
         loop {
-            let next = self
-                .fetch_next_and_decode()
-                .expect("could not decode next instruction");
+            let next = self.fetch_next_and_decode().expect("could not decode next instruction");
             self.exec(next);
 
             if event::poll(self.poll_timeout)? {
@@ -114,6 +123,13 @@ impl Emulator {
                             self.updates.send(Update::Exit)?;
                             break;
                         }
+                        KeyCode::Char('p') => loop {
+                            if let event::Event::Key(key) = event::read()? {
+                                if let KeyCode::Char('p') = key.code {
+                                    break;
+                                }
+                            }
+                        },
                         _ => (),
                     }
                 }
@@ -126,37 +142,38 @@ impl Emulator {
     }
 
     fn exec(&mut self, cmd: Command) {
+        self.updates.send(Update::ProgramCounter(self.pc)).unwrap();
         match cmd {
-            Command::Clear => self.display.clear(),
-            Command::Jump(addr) => self.pc = addr,
-            Command::SubroutinePush(addr) => {
+            Command::Clear(_) => self.screen.clear(),
+            Command::Jump(_, addr) => self.pc = addr,
+            Command::SubroutinePush(_, addr) => {
                 self.stack.push(self.pc);
                 self.pc = addr;
             }
-            Command::SubroutinePop => {
+            Command::SubroutinePop(_) => {
                 self.pc = self.stack.pop().unwrap();
             }
-            Command::SkipEqI(reg, val) => {
+            Command::SkipEqI(_, reg, val) => {
                 if self.registers[reg] == val {
                     self.pc += 2;
                 }
             }
-            Command::SkipNeqI(reg, val) => {
+            Command::SkipNeqI(_, reg, val) => {
                 if self.registers[reg] != val {
                     self.pc += 2;
                 }
             }
-            Command::SkipEq(reg1, reg2) => {
+            Command::SkipEq(_, reg1, reg2) => {
                 if self.registers[reg1] == self.registers[reg2] {
                     self.pc += 2;
                 }
             }
-            Command::SkipNeq(reg1, reg2) => {
+            Command::SkipNeq(_, reg1, reg2) => {
                 if self.registers[reg1] != self.registers[reg2] {
                     self.pc += 2;
                 }
             }
-            Command::Arithmetic(op) => match op {
+            Command::Arithmetic(_, op) => match op {
                 Operation::Set(x, y) => self.registers[x] = self.registers[y],
                 Operation::Or(x, y) => self.registers[x] |= self.registers[y],
                 Operation::And(x, y) => self.registers[x] &= self.registers[y],
@@ -184,20 +201,20 @@ impl Emulator {
                     self.registers[x] = a << 1;
                 }
             },
-            Command::Set(reg, val) => self.registers[reg] = val,
-            Command::Add(reg, val) => self.registers[reg] += val,
-            Command::SetIdx(v) => self.idx_reg = v,
-            Command::JumpX(addr) => self.pc = self.registers[0] as usize + addr,
-            Command::Random(reg, val) => self.registers[reg] = rand::random::<u8>() & val,
-            Command::Display { x, y, height: n } => {
+            Command::Set(_, reg, val) => self.registers[reg] = val,
+            Command::Add(_, reg, val) => self.registers[reg] += val,
+            Command::SetIdx(_, v) => self.idx_reg = v,
+            Command::JumpX(_, addr) => self.pc = self.registers[0] as usize + addr,
+            Command::Random(_, reg, val) => self.registers[reg] = rand::random::<u8>() & val,
+            Command::Display { x, y, height: n, .. } => {
                 let i = self.registers[y] as usize;
                 let j = self.registers[x] as usize;
                 let sprite = self.mem.read(self.idx_reg, n).unwrap();
 
-                let is_px_turned_off = self.display.draw_sprite(i, j, sprite);
+                let is_px_turned_off = self.screen.draw_sprite(i, j, sprite);
                 self.registers[0xF] = if is_px_turned_off { 1 } else { 0 };
             }
-            Command::SkipOnKey(x) => {
+            Command::SkipOnKey(_, x) => {
                 if event::poll(self.poll_timeout).unwrap() {
                     if let Event::Key(key) = event::read().unwrap() {
                         if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
@@ -206,7 +223,7 @@ impl Emulator {
                     }
                 }
             }
-            Command::SkipOffKey(x) => {
+            Command::SkipOffKey(_, x) => {
                 if event::poll(self.poll_timeout).unwrap() {
                     if let Event::Key(key) = event::read().unwrap() {
                         if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
@@ -216,10 +233,10 @@ impl Emulator {
                 }
                 self.pc += 2;
             }
-            Command::ReadDelay(x) => self.registers[x] = self.delay_timer.get(),
-            Command::SetDelay(x) => self.delay_timer.set(self.registers[x]),
-            Command::SetSound(x) => self.sound_timer.set(self.registers[x]),
-            Command::AddIdx(x) => {
+            Command::ReadDelay(_, x) => self.registers[x] = self.delay_timer.get(),
+            Command::SetDelay(_, x) => self.delay_timer.set(self.registers[x]),
+            Command::SetSound(_, x) => self.sound_timer.set(self.registers[x]),
+            Command::AddIdx(_, x) => {
                 let a = self.idx_reg;
                 let sum = a + self.registers[x] as usize;
                 if sum > 0x0FFF && a <= 0x0FFF {
@@ -227,7 +244,7 @@ impl Emulator {
                 }
                 self.idx_reg = sum;
             }
-            Command::GetKey(x) => loop {
+            Command::GetKey(_, x) => loop {
                 if let Event::Key(key) = event::read().unwrap() {
                     if let KeyCode::Char(c) = key.code {
                         match KEY_MAP.iter().position(|x| *x == c) {
@@ -240,19 +257,16 @@ impl Emulator {
                     }
                 }
             },
-            Command::FontChar(x) => self.idx_reg = 0x100 + (self.registers[x] & 0x0F) as usize,
-            Command::BCD(x) => {
+            Command::FontChar(_, x) => self.idx_reg = 0x100 + (self.registers[x] & 0x0F) as usize,
+            Command::BCD(_, x) => {
                 let mut a = self.registers[x];
                 for i in 0..3 {
                     self.mem.write(self.idx_reg + i, &[a % 10]).unwrap();
                     a /= 10;
                 }
             }
-            Command::StoreMem(x) => self
-                .mem
-                .write(self.idx_reg, &self.registers[0..=x])
-                .unwrap(),
-            Command::ReadMem(x) => {
+            Command::StoreMem(_, x) => self.mem.write(self.idx_reg, &self.registers[0..=x]).unwrap(),
+            Command::ReadMem(_, x) => {
                 self.registers[0..=x].copy_from_slice(&self.mem.read(self.idx_reg, x + 1).unwrap())
             }
             _ => (),
@@ -319,11 +333,7 @@ fn split_u16_into_bytes(x: u16) -> (u8, u8) {
 
 #[test]
 fn test_split_u16_into_bytes() {
-    let tests = vec![
-        (0xABCD, 0xAB, 0xCD),
-        (0x0000, 0x00, 0x00),
-        (0x0A0A, 0x0A, 0x0A),
-    ];
+    let tests = vec![(0xABCD, 0xAB, 0xCD), (0x0000, 0x00, 0x00), (0x0A0A, 0x0A, 0x0A)];
     for test in tests {
         assert_eq!(split_u16_into_bytes(test.0), (test.1, test.2));
     }
@@ -341,10 +351,7 @@ fn split_u8_into_bits(mut x: u8) -> [bool; 8] {
 
 #[test]
 fn test_split_u8_into_bits() {
-    let tests = vec![(
-        0b01010101,
-        [false, true, false, true, false, true, false, true],
-    )];
+    let tests = vec![(0b01010101, [false, true, false, true, false, true, false, true])];
     for test in tests {
         assert_eq!(split_u8_into_bits(test.0), test.1);
     }
@@ -352,42 +359,86 @@ fn test_split_u8_into_bits() {
 
 #[derive(Debug, PartialEq)]
 enum Command {
-    Nop,   // just to be safe
-    Clear, // 0x00E0
+    Nop(u16),   // just to be safe
+    Clear(u16), // 0x00E0
 
-    Jump(usize),           // 0x1NNN
-    SubroutinePush(usize), // 0x2NNN
-    SubroutinePop,         // 0x00EE
+    Jump(u16, usize),           // 0x1NNN
+    SubroutinePush(u16, usize), // 0x2NNN
+    SubroutinePop(u16),         // 0x00EE
 
-    SkipEqI(usize, u8),    // 0x3XNN
-    SkipNeqI(usize, u8),   // 0x4XNN
-    SkipEq(usize, usize),  // 0x5XY0
-    SkipNeq(usize, usize), // 0x9XY0
+    SkipEqI(u16, usize, u8),    // 0x3XNN
+    SkipNeqI(u16, usize, u8),   // 0x4XNN
+    SkipEq(u16, usize, usize),  // 0x5XY0
+    SkipNeq(u16, usize, usize), // 0x9XY0
 
-    Set(usize, u8), // 0x6XNN
-    Add(usize, u8), // 0x7XNN
+    Set(u16, usize, u8), // 0x6XNN
+    Add(u16, usize, u8), // 0x7XNN
 
-    Arithmetic(Operation), // a bunch
+    Arithmetic(u16, Operation), // a bunch
 
-    SetIdx(usize),                                 // 0xANNN
-    JumpX(usize),                                  // 0xBNNN
-    Random(usize, u8),                             // 0xCXNN
-    Display { x: usize, y: usize, height: usize }, // 0xDXYN
+    SetIdx(u16, usize),     // 0xANNN
+    JumpX(u16, usize),      // 0xBNNN
+    Random(u16, usize, u8), // 0xCXNN
+    Display {
+        instruction: u16,
+        x: usize,
+        y: usize,
+        height: usize,
+    }, // 0xDXYN
 
-    SkipOnKey(usize),  // 0xEX9E
-    SkipOffKey(usize), // 0xEXA1
+    SkipOnKey(u16, usize),  // 0xEX9E
+    SkipOffKey(u16, usize), // 0xEXA1
 
-    ReadDelay(usize), // 0xFX07
-    SetDelay(usize),  // 0xFX15
-    SetSound(usize),  // 0xFX18
+    ReadDelay(u16, usize), // 0xFX07
+    SetDelay(u16, usize),  // 0xFX15
+    SetSound(u16, usize),  // 0xFX18
 
-    AddIdx(usize),   // 0xFX1E
-    GetKey(usize),   // 0xFX0A
-    FontChar(usize), // 0xFX29
-    BCD(usize),      // 0xFX33
+    AddIdx(u16, usize),   // 0xFX1E
+    GetKey(u16, usize),   // 0xFX0A
+    FontChar(u16, usize), // 0xFX29
+    BCD(u16, usize),      // 0xFX33
 
-    StoreMem(usize), // 0xFX55
-    ReadMem(usize),  // 0xFX65
+    StoreMem(u16, usize), // 0xFX55
+    ReadMem(u16, usize),  // 0xFX65
+}
+
+impl ToString for Command {
+    fn to_string(&self) -> String {
+        match self {
+            Command::Nop(i) => format!("{:#06x} nop", i),
+            Command::Clear(i) => format!("{:#06x} clear screen", i),
+            Command::Jump(i, addr) => format!("{:#06x} jump to {:#05x}", i, addr),
+            Command::SubroutinePush(i, addr) => format!("{:#06x} subroutine at {:#06x}", i, addr),
+            Command::SubroutinePop(i) => format!("{:#06x} return from subroutine", i),
+            Command::SkipEqI(i, x, y) => format!("{:#06x} skip if V{} == {:#04x}", i, x, y),
+            Command::SkipNeqI(i, x, y) => format!("{:#06x} skip if V{} != {:#04x}", i, x, y),
+            Command::SkipEq(i, x, y) => format!("{:#06x} skip if V{} == V{}", i, x, y),
+            Command::SkipNeq(i, x, y) => format!("{:#06x} skip if V{} != V{}", i, x, y),
+            Command::Set(i, x, y) => format!("{:#06x} set V{} = {:#04x}", i, x, y),
+            Command::Add(i, x, nn) => format!("{:#06x} add {:#04x} to V{}", i, nn, x),
+            Command::Arithmetic(i, op) => format!("{:#06x} {}", i, op),
+            Command::SetIdx(i, addr) => format!("{:#06x} set I to {:#05x}", i, addr),
+            Command::JumpX(i, addr) => format!("{:#06x} jump to {:#05x} + V0", i, addr),
+            Command::Random(i, x, nn) => format!("{:#06x} set V{} to random with mask {:#04x}", i, x, nn),
+            Command::Display {
+                instruction,
+                x,
+                y,
+                height,
+            } => format!("{:#06x} display 8x{} at ({}, {})", instruction, height, x, y),
+            Command::SkipOnKey(i, x) => format!("{:#06x} skip if V{} key pressed", i, x),
+            Command::SkipOffKey(i, x) => format!("{:#06x} skip if V{} key not pressed", i, x),
+            Command::ReadDelay(i, x) => format!("{:#06x} read delay timer into V{}", i, x),
+            Command::SetDelay(i, x) => format!("{:#06x} set delay timer to V{}", i, x),
+            Command::SetSound(i, x) => format!("{:#06x} set sound timer to V{}", i, x),
+            Command::AddIdx(i, x) => format!("{:#06x} add V{} to I", i, x),
+            Command::GetKey(i, x) => format!("{:#06x} wait for key press and store in V{}", i, x),
+            Command::FontChar(i, x) => format!("{:#06x} set I to font sprite for char V{}", i, x),
+            Command::BCD(i, x) => format!("{:#06x} set mem @ I to BCD of V{}", i, x),
+            Command::StoreMem(i, x) => format!("{:#06x} set mem @ I to V0-V{}", i, x),
+            Command::ReadMem(i, x) => format!("{:#06x} read mem @ I to V0-V{}", i, x),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -402,6 +453,21 @@ enum Operation {
     ShiftR(usize, usize), // 0x8XYE
 }
 
+impl fmt::Display for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Operation::Set(x, y) => write!(f, "set V{} = V{}", x, y),
+            Operation::Or(x, y) => write!(f, "V{} = V{} | V{}", x, x, y),
+            Operation::And(x, y) => write!(f, "V{} = V{} & V{}", x, x, y),
+            Operation::Xor(x, y) => write!(f, "V{} = V{} ^ V{}", x, x, y),
+            Operation::Add(x, y) => write!(f, "V{} = V{} + V{}", x, x, y),
+            Operation::Sub(x, y) => write!(f, "V{} = V{} - V{}", x, x, y),
+            Operation::ShiftL(x, y) => write!(f, "V{} = V{} << 1", x, y),
+            Operation::ShiftR(x, y) => write!(f, "V{} = V{} >> 1", x, y),
+        }
+    }
+}
+
 impl Command {
     fn from(i: u16) -> Self {
         let opcode = (i & 0xF000) >> 12;
@@ -412,53 +478,58 @@ impl Command {
         let nnn = (i & 0x0FFF) as usize;
 
         match opcode {
-            0x0 => match n {
-                0x0 => Command::Clear,
-                0xE => Command::SubroutinePop,
-                _ => Command::Nop,
+            0x0 => match nnn {
+                0x0E0 => Command::Clear(i),
+                0x0EE => Command::SubroutinePop(i),
+                _ => Command::Nop(i),
             },
-            0x1 => Command::Jump(nnn),
-            0x2 => Command::SubroutinePush(nnn),
-            0x3 => Command::SkipEqI(x, nn),
-            0x4 => Command::SkipNeqI(x, nn),
-            0x5 => Command::SkipEq(x, y),
-            0x6 => Command::Set(x, nn),
-            0x7 => Command::Add(x, nn),
+            0x1 => Command::Jump(i, nnn),
+            0x2 => Command::SubroutinePush(i, nnn),
+            0x3 => Command::SkipEqI(i, x, nn),
+            0x4 => Command::SkipNeqI(i, x, nn),
+            0x5 => Command::SkipEq(i, x, y),
+            0x6 => Command::Set(i, x, nn),
+            0x7 => Command::Add(i, x, nn),
             0x8 => match n {
-                0x0 => Command::Arithmetic(Operation::Set(x, y)),
-                0x1 => Command::Arithmetic(Operation::Or(x, y)),
-                0x2 => Command::Arithmetic(Operation::And(x, y)),
-                0x3 => Command::Arithmetic(Operation::Xor(x, y)),
-                0x4 => Command::Arithmetic(Operation::Add(x, y)),
-                0x5 => Command::Arithmetic(Operation::Sub(x, y)),
-                0x7 => Command::Arithmetic(Operation::Sub(y, x)),
-                0x6 => Command::Arithmetic(Operation::ShiftR(x, y)),
-                0xE => Command::Arithmetic(Operation::ShiftL(x, y)),
-                _ => Command::Nop,
+                0x0 => Command::Arithmetic(i, Operation::Set(x, y)),
+                0x1 => Command::Arithmetic(i, Operation::Or(x, y)),
+                0x2 => Command::Arithmetic(i, Operation::And(x, y)),
+                0x3 => Command::Arithmetic(i, Operation::Xor(x, y)),
+                0x4 => Command::Arithmetic(i, Operation::Add(x, y)),
+                0x5 => Command::Arithmetic(i, Operation::Sub(x, y)),
+                0x7 => Command::Arithmetic(i, Operation::Sub(y, x)),
+                0x6 => Command::Arithmetic(i, Operation::ShiftR(x, y)),
+                0xE => Command::Arithmetic(i, Operation::ShiftL(x, y)),
+                _ => Command::Nop(i),
             },
-            0x9 => Command::SkipNeq(x, y),
-            0xA => Command::SetIdx(nnn),
-            0xB => Command::JumpX(nnn),
-            0xC => Command::Random(x, nn),
-            0xD => Command::Display { x, y, height: n },
+            0x9 => Command::SkipNeq(i, x, y),
+            0xA => Command::SetIdx(i, nnn),
+            0xB => Command::JumpX(i, nnn),
+            0xC => Command::Random(i, x, nn),
+            0xD => Command::Display {
+                instruction: i,
+                x,
+                y,
+                height: n,
+            },
             0xE => match nn {
-                0x9E => Command::SkipOnKey(x),
-                0xA1 => Command::SkipOffKey(x),
-                _ => Command::Nop,
+                0x9E => Command::SkipOnKey(i, x),
+                0xA1 => Command::SkipOffKey(i, x),
+                _ => Command::Nop(i),
             },
             0xF => match nn {
-                0x07 => Command::ReadDelay(x),
-                0x15 => Command::SetDelay(x),
-                0x18 => Command::SetSound(x),
-                0x1E => Command::AddIdx(x),
-                0x0A => Command::GetKey(x),
-                0x29 => Command::FontChar(x),
-                0x33 => Command::BCD(x),
-                0x55 => Command::StoreMem(x),
-                0x65 => Command::ReadMem(x),
-                _ => Command::Nop,
+                0x07 => Command::ReadDelay(i, x),
+                0x15 => Command::SetDelay(i, x),
+                0x18 => Command::SetSound(i, x),
+                0x1E => Command::AddIdx(i, x),
+                0x0A => Command::GetKey(i, x),
+                0x29 => Command::FontChar(i, x),
+                0x33 => Command::BCD(i, x),
+                0x55 => Command::StoreMem(i, x),
+                0x65 => Command::ReadMem(i, x),
+                _ => Command::Nop(i),
             },
-            _ => Command::Nop,
+            _ => Command::Nop(i),
         }
     }
 }
@@ -470,47 +541,48 @@ mod test_command {
     #[test]
     fn decode() {
         let tests = vec![
-            (0x00E0, Command::Clear),
-            (0x1ABC, Command::Jump(0xABC)),
-            (0x2ABC, Command::SubroutinePush(0xABC)),
-            (0x00EE, Command::SubroutinePop),
-            (0x3ABC, Command::SkipEqI(0xA, 0xBC)),
-            (0x4ABC, Command::SkipNeqI(0xA, 0xBC)),
-            (0x5AB0, Command::SkipEq(0xA, 0xB)),
-            (0x9AB0, Command::SkipNeq(0xA, 0xB)),
-            (0x6ABC, Command::Set(0xA, 0xBC)),
-            (0x7ABC, Command::Add(0xA, 0xBC)),
-            (0x8AB0, Command::Arithmetic(Operation::Set(0xA, 0xB))),
-            (0x8AB1, Command::Arithmetic(Operation::Or(0xA, 0xB))),
-            (0x8AB2, Command::Arithmetic(Operation::And(0xA, 0xB))),
-            (0x8AB3, Command::Arithmetic(Operation::Xor(0xA, 0xB))),
-            (0x8AB4, Command::Arithmetic(Operation::Add(0xA, 0xB))),
-            (0x8AB5, Command::Arithmetic(Operation::Sub(0xA, 0xB))),
-            (0x8AB7, Command::Arithmetic(Operation::Sub(0xB, 0xA))),
-            (0x8AB6, Command::Arithmetic(Operation::ShiftR(0xA, 0xB))),
-            (0x8ABE, Command::Arithmetic(Operation::ShiftL(0xA, 0xB))),
-            (0xAABC, Command::SetIdx(0xABC)),
-            (0xBABC, Command::JumpX(0xABC)),
-            (0xCABC, Command::Random(0xA, 0xBC)),
+            (0x00e0, Command::Clear(0x00e0)),
+            (0x1abc, Command::Jump(0x1abc, 0xabc)),
+            (0x2abc, Command::SubroutinePush(0x2abc, 0xabc)),
+            (0x00ee, Command::SubroutinePop(0x00ee)),
+            (0x3abc, Command::SkipEqI(0x3abc, 0xa, 0xbc)),
+            (0x4abc, Command::SkipNeqI(0x4abc, 0xa, 0xbc)),
+            (0x5ab0, Command::SkipEq(0x5ab0, 0xa, 0xb)),
+            (0x9ab0, Command::SkipNeq(0x9ab0, 0xa, 0xb)),
+            (0x6abc, Command::Set(0x6abc, 0xa, 0xbc)),
+            (0x7abc, Command::Add(0x7abc, 0xa, 0xbc)),
+            (0x8ab0, Command::Arithmetic(0x8ab0, Operation::Set(0xa, 0xb))),
+            (0x8ab1, Command::Arithmetic(0x8ab1, Operation::Or(0xa, 0xb))),
+            (0x8ab2, Command::Arithmetic(0x8ab2, Operation::And(0xa, 0xb))),
+            (0x8ab3, Command::Arithmetic(0x8ab3, Operation::Xor(0xA, 0xB))),
+            (0x8ab4, Command::Arithmetic(0x8ab4, Operation::Add(0xA, 0xB))),
+            (0x8ab5, Command::Arithmetic(0x8ab5, Operation::Sub(0xA, 0xB))),
+            (0x8ab7, Command::Arithmetic(0x8ab7, Operation::Sub(0xB, 0xA))),
+            (0x8ab6, Command::Arithmetic(0x8ab6, Operation::ShiftR(0xA, 0xB))),
+            (0x8abe, Command::Arithmetic(0x8abe, Operation::ShiftL(0xA, 0xB))),
+            (0xaabc, Command::SetIdx(0xaabc, 0xABC)),
+            (0xbabc, Command::JumpX(0xbabc, 0xABC)),
+            (0xcabc, Command::Random(0xcabc, 0xA, 0xBC)),
             (
-                0xDABC,
+                0xdabc,
                 Command::Display {
+                    instruction: 0xdabc,
                     x: 0xA,
                     y: 0xB,
                     height: 0xC,
                 },
             ),
-            (0xEA9E, Command::SkipOnKey(0xA)),
-            (0xEAA1, Command::SkipOffKey(0xA)),
-            (0xFA07, Command::ReadDelay(0xA)),
-            (0xFA15, Command::SetDelay(0xA)),
-            (0xFA18, Command::SetSound(0xA)),
-            (0xFA1E, Command::AddIdx(0xA)),
-            (0xFA0A, Command::GetKey(0xA)),
-            (0xFA29, Command::FontChar(0xA)),
-            (0xFA33, Command::BCD(0xA)),
-            (0xFA55, Command::StoreMem(0xA)),
-            (0xFA65, Command::ReadMem(0xA)),
+            (0xea9e, Command::SkipOnKey(0xea9e, 0xA)),
+            (0xeaa1, Command::SkipOffKey(0xeaa1, 0xA)),
+            (0xfa07, Command::ReadDelay(0xfa07, 0xA)),
+            (0xfa15, Command::SetDelay(0xfa15, 0xA)),
+            (0xfa18, Command::SetSound(0xfa18, 0xA)),
+            (0xfa1e, Command::AddIdx(0xfa1e, 0xA)),
+            (0xfa0a, Command::GetKey(0xfa0a, 0xA)),
+            (0xfa29, Command::FontChar(0xfa29, 0xA)),
+            (0xfa33, Command::BCD(0xfa33, 0xA)),
+            (0xfa55, Command::StoreMem(0xfa55, 0xA)),
+            (0xfa65, Command::ReadMem(0xfa65, 0xA)),
         ];
         for test in tests {
             assert_eq!(Command::from(test.0), test.1);
@@ -555,22 +627,22 @@ impl Memory for [u8] {
 const MEM_SIZE: usize = 0x1000;
 
 const FONT_DATA: [u8; 80] = [
-    0xF0, 0x90, 0x90, 0x90, 0xF0, // 0
+    0xf0, 0x90, 0x90, 0x90, 0xf0, // 0
     0x20, 0x60, 0x20, 0x20, 0x70, // 1
-    0xF0, 0x10, 0xF0, 0x80, 0xF0, // 2
-    0xF0, 0x10, 0xF0, 0x10, 0xF0, // 3
-    0x90, 0x90, 0xF0, 0x10, 0x10, // 4
-    0xF0, 0x80, 0xF0, 0x10, 0xF0, // 5
-    0xF0, 0x80, 0xF0, 0x90, 0xF0, // 6
-    0xF0, 0x10, 0x20, 0x40, 0x40, // 7
-    0xF0, 0x90, 0xF0, 0x90, 0xF0, // 8
-    0xF0, 0x90, 0xF0, 0x10, 0xF0, // 9
-    0xF0, 0x90, 0xF0, 0x90, 0x90, // A
-    0xE0, 0x90, 0xE0, 0x90, 0xE0, // B
-    0xF0, 0x80, 0x80, 0x80, 0xF0, // C
-    0xE0, 0x90, 0x90, 0x90, 0xE0, // D
-    0xF0, 0x80, 0xF0, 0x80, 0xF0, // E
-    0xF0, 0x80, 0xF0, 0x80, 0x80, // F
+    0xf0, 0x10, 0xf0, 0x80, 0xf0, // 2
+    0xf0, 0x10, 0xf0, 0x10, 0xf0, // 3
+    0x90, 0x90, 0xf0, 0x10, 0x10, // 4
+    0xf0, 0x80, 0xf0, 0x10, 0xf0, // 5
+    0xf0, 0x80, 0xf0, 0x90, 0xf0, // 6
+    0xf0, 0x10, 0x20, 0x40, 0x40, // 7
+    0xf0, 0x90, 0xf0, 0x90, 0xf0, // 8
+    0xf0, 0x90, 0xf0, 0x10, 0xf0, // 9
+    0xf0, 0x90, 0xf0, 0x90, 0x90, // A
+    0xe0, 0x90, 0xe0, 0x90, 0xe0, // B
+    0xf0, 0x80, 0x80, 0x80, 0xf0, // C
+    0xe0, 0x90, 0x90, 0x90, 0xe0, // D
+    0xf0, 0x80, 0xf0, 0x80, 0xf0, // E
+    0xf0, 0x80, 0xf0, 0x80, 0x80, // F
 ];
 
 #[cfg(test)]
@@ -670,12 +742,12 @@ mod test_timer {
 
 type Pixels = Arc<Mutex<[bool; 64 * 32]>>;
 
-struct Display {
+struct Screen {
     pixels: Pixels,
     updates: mpsc::Sender<Update>,
 }
 
-impl Display {
+impl Screen {
     fn new(tx: mpsc::Sender<Update>) -> Self {
         Self {
             updates: tx,
@@ -738,21 +810,21 @@ impl Display {
 
 #[cfg(test)]
 mod test_pixels {
-    use crate::Display;
+    use crate::Screen;
     use rand::prelude::*;
     use std::sync::mpsc;
 
     #[test]
     fn can_set_out_of_screen() {
         let (tx, _) = mpsc::channel();
-        let mut pxs = Display::new(tx);
+        let mut pxs = Screen::new(tx);
         pxs.set(33, 65);
     }
 
     #[test]
     fn clear() {
         let (tx, _) = mpsc::channel();
-        let mut pxs = Display::new(tx);
+        let mut pxs = Screen::new(tx);
         let mut rng = thread_rng();
         for _ in 0..64 {
             let i = rng.gen_range(0..32);
@@ -769,17 +841,21 @@ mod test_pixels {
 enum Update {
     Nop,
     Exit,
-    Log(String),
+    ProgramCounter(usize),
 }
 
 struct UI {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     pixels: Pixels,
     updates: mpsc::Receiver<Update>,
+
+    /// All instructions of the program.
+    instructions: Vec<Command>,
+    current_instruction: usize,
 }
 
 impl UI {
-    fn new(rx: mpsc::Receiver<Update>, pixels: Pixels) -> Self {
+    fn new(rx: mpsc::Receiver<Update>, pixels: Pixels, instructions: Vec<Command>) -> Self {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).unwrap();
@@ -788,6 +864,8 @@ impl UI {
             terminal,
             updates: rx,
             pixels,
+            instructions,
+            current_instruction: 0,
         }
     }
 
@@ -799,41 +877,48 @@ impl UI {
         loop {
             match self.updates.try_recv() {
                 Ok(Update::Exit) | Err(TryRecvError::Disconnected) => break,
+                Ok(Update::ProgramCounter(pc)) => self.current_instruction = (pc - 0x200) / 2,
                 _ => (),
             }
             self.terminal
                 .draw(|f| {
-                    ui(f, self.pixels.clone());
+                    ui(f, self.pixels.clone(), &self.instructions, self.current_instruction);
                 })
                 .unwrap();
         }
 
         terminal::disable_raw_mode().unwrap();
-        crossterm::execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )
-        .unwrap();
+        crossterm::execute!(self.terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).unwrap();
         self.terminal.show_cursor().unwrap();
     }
 }
 
-fn ui<B: Backend>(f: &mut Frame<B>, pixels: Arc<Mutex<[bool; 64 * 32]>>) {
+fn ui<B: Backend>(
+    f: &mut Frame<B>,
+    pixels: Arc<Mutex<[bool; 64 * 32]>>,
+    instructions: &[Command],
+    current_instruction: usize,
+) {
+    // Split screen into top and bottom halves.
     let screen = Layout::default()
         .direction(layout::Direction::Vertical)
-        .constraints(
-            [
-                layout::Constraint::Percentage(50),
-                layout::Constraint::Percentage(50),
-            ]
-            .as_ref(),
-        )
+        .constraints([layout::Constraint::Percentage(50), layout::Constraint::Percentage(50)].as_ref())
         .split(f.size());
 
     let top = screen[0];
     let bot = screen[1];
 
+    // Split each half into a left and right portion.
+    let top = Layout::default()
+        .direction(layout::Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(top);
+    let bot = Layout::default()
+        .direction(layout::Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+        .split(bot);
+
+    // Create the game screen.
     let main_screen = Canvas::default()
         .block(Block::default().borders(Borders::ALL).title("CHIP-8"))
         .marker(Marker::Block)
@@ -858,10 +943,22 @@ fn ui<B: Backend>(f: &mut Frame<B>, pixels: Arc<Mutex<[bool; 64 * 32]>>) {
             })
         });
 
-    let top = Layout::default()
-        .direction(layout::Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-        .split(top);
+    let instructions_list: Vec<ListItem> = instructions
+        .iter()
+        .map(|i| ListItem::new(Spans::from(vec![Span::raw(i.to_string())])))
+        .collect();
+    let mut instructions_state = ListState::default();
+    instructions_state.select(Some(current_instruction));
+    let instructions_widget = List::new(instructions_list)
+        .block(Block::default().borders(Borders::ALL).title("Instructions"))
+        .highlight_style(
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Black)
+                .bg(Color::White),
+        )
+        .highlight_symbol(">");
 
     f.render_widget(main_screen, top[0]);
+    f.render_stateful_widget(instructions_widget, bot[0], &mut instructions_state);
 }
