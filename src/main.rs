@@ -19,7 +19,7 @@ use tui::{
     style::Color,
     style::{Modifier, Style},
     symbols::Marker,
-    text::{Span, Spans, Text},
+    text::{Span, Spans},
     widgets::{
         canvas::{Canvas, Points},
         Block, Borders, List, ListItem, ListState,
@@ -41,16 +41,16 @@ fn main() -> Result<(), io::Error> {
     let (tx, rx) = mpsc::channel();
     let mut emulator = Emulator::new(tx, time::Duration::from_millis(10));
     emulator.load(&rom).expect("could not load ROM");
-    let cmds = rom
+    let instructions = rom
         .iter()
         .fold(vec![], |mut accum, byte| {
             accum.push((0 | *byte as u16) << 8 | *byte as u16);
             accum
         })
         .iter()
-        .map(|instruction| Command::from(*instruction))
+        .map(|instruction| Instruction::from(*instruction))
         .collect();
-    let mut ui = UI::new(rx, emulator.screen.pixels.clone(), cmds);
+    let mut ui = UI::new(rx, emulator.screen.pixels.clone(), instructions);
 
     thread::spawn(move || {
         emulator.run().expect("emulator crashed");
@@ -60,17 +60,25 @@ fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
+enum State {
+    Normal,
+    Paused,
+    Debug,
+}
+
 struct Emulator {
     pc: usize,
     mem: [u8; 0x1000],
-    updates: mpsc::Sender<Update>,
+    update_tx: mpsc::Sender<Update>,
     poll_timeout: time::Duration,
     screen: Screen,
+    /// The I register.
     idx_reg: usize,
     registers: [u8; 0x10],
     stack: Vec<usize>,
     delay_timer: Timer,
     sound_timer: Timer,
+    state: State,
 }
 
 impl Emulator {
@@ -81,16 +89,18 @@ impl Emulator {
             pc: 0x200,
             mem,
             poll_timeout,
-            updates: tx.clone(),
+            update_tx: tx.clone(),
             screen: Screen::new(tx),
             idx_reg: 0,
             registers: [0; 0x10],
             stack: vec![],
             delay_timer: Timer::new(0, TIMER_INTERVAL),
             sound_timer: Timer::new(0, TIMER_INTERVAL),
+            state: State::Normal,
         }
     }
 
+    /// Loads the ROM to address 0x200.
     fn load(&mut self, rom: &[u8]) -> Result<(), ErrMemory> {
         if rom.len() > 0x1000 - 0x200 {
             Err(ErrMemory::Overflow)
@@ -100,80 +110,116 @@ impl Emulator {
         }
     }
 
-    fn fetch_next_and_decode(&mut self) -> Result<Command, ErrMemory> {
+    /// Fetches the next instruction pointed to by the program counter and
+    /// decodes it into an Instruction.
+    fn fetch_next_and_decode(&mut self) -> Result<Instruction, ErrMemory> {
         if let [a, b] = *self.mem.read(self.pc, 2)? {
             self.pc += 2;
             let i: u16 = (0 | a as u16) << 8 | b as u16;
-            Ok(Command::from(i))
+            Ok(Instruction::from(i))
         } else {
             // This should never happen.
             panic!()
         }
     }
 
+    /// Start the emulator.
     fn run(&mut self) -> Result<(), Box<dyn error::Error>> {
         loop {
-            let next = self.fetch_next_and_decode().expect("could not decode next instruction");
-            self.exec(next);
+            match self.state {
+                State::Normal => {
+                    let next = self.fetch_next_and_decode().expect("could not decode next instruction");
+                    self.exec(next);
 
-            if event::poll(self.poll_timeout)? {
-                if let event::Event::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('k') => {
-                            self.updates.send(Update::Exit)?;
-                            break;
-                        }
-                        KeyCode::Char('p') => loop {
-                            if let event::Event::Key(key) = event::read()? {
-                                if let KeyCode::Char('p') = key.code {
-                                    break;
-                                }
+                    let key = try_get_key(self.poll_timeout);
+                    match key {
+                        None => (),
+                        Some(key) => match key {
+                            KeyCode::Char('i') => self.state = State::Debug,
+                            KeyCode::Char('o') => {
+                                self.update_tx.send(Update::Exit)?;
+                                break;
                             }
+                            KeyCode::Char('p') => self.state = State::Paused,
+                            _ => (),
                         },
-                        _ => (),
+                    }
+                }
+                State::Paused => {
+                    let key = try_get_key(self.poll_timeout);
+                    match key {
+                        None => (),
+                        Some(key) => match key {
+                            KeyCode::Char('i') => self.state = State::Debug,
+                            KeyCode::Char('o') => {
+                                self.update_tx.send(Update::Exit)?;
+                                break;
+                            }
+                            KeyCode::Char('p') => self.state = State::Normal,
+                            _ => (),
+                        },
+                    }
+                }
+                State::Debug => {
+                    let key = try_get_key(self.poll_timeout);
+                    match key {
+                        None => (),
+                        Some(key) => match key {
+                            KeyCode::Char('i') => self.state = State::Normal,
+                            KeyCode::Char('o') => {
+                                self.update_tx.send(Update::Exit)?;
+                                break;
+                            }
+                            KeyCode::Char('p') => self.state = State::Paused,
+                            KeyCode::Enter => {
+                                let next = self.fetch_next_and_decode().expect("could not decode next instruction");
+                                self.exec(next);
+                            }
+                            _ => (),
+                        },
                     }
                 }
             }
-
             thread::sleep(EMULATOR_INTERVAL);
         }
 
         Ok(())
     }
 
-    fn exec(&mut self, cmd: Command) {
-        self.updates.send(Update::ProgramCounter(self.pc)).unwrap();
-        match cmd {
-            Command::Clear(_) => self.screen.clear(),
-            Command::Jump(_, addr) => self.pc = addr,
-            Command::SubroutinePush(_, addr) => {
+    /// Executes a single instruction.
+    fn exec(&mut self, instr: Instruction) {
+        self.update_tx.send(Update::ProgramCounter(self.pc)).unwrap();
+        match instr {
+            Instruction::Clear(_) => self.screen.clear(),
+            Instruction::Jump(_, addr) => self.pc = addr,
+            Instruction::SubroutinePush(_, addr) => {
                 self.stack.push(self.pc);
                 self.pc = addr;
             }
-            Command::SubroutinePop(_) => {
+            Instruction::SubroutinePop(_) => {
                 self.pc = self.stack.pop().unwrap();
             }
-            Command::SkipEqI(_, reg, val) => {
+            Instruction::SkipEqI(_, reg, val) => {
                 if self.registers[reg] == val {
                     self.pc += 2;
                 }
             }
-            Command::SkipNeqI(_, reg, val) => {
+            Instruction::SkipNeqI(_, reg, val) => {
                 if self.registers[reg] != val {
                     self.pc += 2;
                 }
             }
-            Command::SkipEq(_, reg1, reg2) => {
+            Instruction::SkipEq(_, reg1, reg2) => {
                 if self.registers[reg1] == self.registers[reg2] {
                     self.pc += 2;
                 }
             }
-            Command::SkipNeq(_, reg1, reg2) => {
+            Instruction::SkipNeq(_, reg1, reg2) => {
                 if self.registers[reg1] != self.registers[reg2] {
                     self.pc += 2;
                 }
             }
-            Command::Arithmetic(_, op) => match op {
+            Instruction::Arithmetic(_, op) => match op {
                 Operation::Set(x, y) => self.registers[x] = self.registers[y],
                 Operation::Or(x, y) => self.registers[x] |= self.registers[y],
                 Operation::And(x, y) => self.registers[x] &= self.registers[y],
@@ -201,12 +247,12 @@ impl Emulator {
                     self.registers[x] = a << 1;
                 }
             },
-            Command::Set(_, reg, val) => self.registers[reg] = val,
-            Command::Add(_, reg, val) => self.registers[reg] += val,
-            Command::SetIdx(_, v) => self.idx_reg = v,
-            Command::JumpX(_, addr) => self.pc = self.registers[0] as usize + addr,
-            Command::Random(_, reg, val) => self.registers[reg] = rand::random::<u8>() & val,
-            Command::Display { x, y, height: n, .. } => {
+            Instruction::Set(_, reg, val) => self.registers[reg] = val,
+            Instruction::Add(_, reg, val) => self.registers[reg] += val,
+            Instruction::SetIdx(_, v) => self.idx_reg = v,
+            Instruction::JumpX(_, addr) => self.pc = self.registers[0] as usize + addr,
+            Instruction::Random(_, reg, val) => self.registers[reg] = rand::random::<u8>() & val,
+            Instruction::Display { x, y, height: n, .. } => {
                 let i = self.registers[y] as usize;
                 let j = self.registers[x] as usize;
                 let sprite = self.mem.read(self.idx_reg, n).unwrap();
@@ -214,7 +260,7 @@ impl Emulator {
                 let is_px_turned_off = self.screen.draw_sprite(i, j, sprite);
                 self.registers[0xF] = if is_px_turned_off { 1 } else { 0 };
             }
-            Command::SkipOnKey(_, x) => {
+            Instruction::SkipOnKey(_, x) => {
                 if event::poll(self.poll_timeout).unwrap() {
                     if let Event::Key(key) = event::read().unwrap() {
                         if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
@@ -223,7 +269,7 @@ impl Emulator {
                     }
                 }
             }
-            Command::SkipOffKey(_, x) => {
+            Instruction::SkipOffKey(_, x) => {
                 if event::poll(self.poll_timeout).unwrap() {
                     if let Event::Key(key) = event::read().unwrap() {
                         if key.code == KeyCode::Char(KEY_MAP[self.registers[x] as usize]) {
@@ -233,10 +279,10 @@ impl Emulator {
                 }
                 self.pc += 2;
             }
-            Command::ReadDelay(_, x) => self.registers[x] = self.delay_timer.get(),
-            Command::SetDelay(_, x) => self.delay_timer.set(self.registers[x]),
-            Command::SetSound(_, x) => self.sound_timer.set(self.registers[x]),
-            Command::AddIdx(_, x) => {
+            Instruction::ReadDelay(_, x) => self.registers[x] = self.delay_timer.get(),
+            Instruction::SetDelay(_, x) => self.delay_timer.set(self.registers[x]),
+            Instruction::SetSound(_, x) => self.sound_timer.set(self.registers[x]),
+            Instruction::AddIdx(_, x) => {
                 let a = self.idx_reg;
                 let sum = a + self.registers[x] as usize;
                 if sum > 0x0FFF && a <= 0x0FFF {
@@ -244,7 +290,7 @@ impl Emulator {
                 }
                 self.idx_reg = sum;
             }
-            Command::GetKey(_, x) => loop {
+            Instruction::GetKey(_, x) => loop {
                 if let Event::Key(key) = event::read().unwrap() {
                     if let KeyCode::Char(c) = key.code {
                         match KEY_MAP.iter().position(|x| *x == c) {
@@ -257,21 +303,42 @@ impl Emulator {
                     }
                 }
             },
-            Command::FontChar(_, x) => self.idx_reg = 0x100 + (self.registers[x] & 0x0F) as usize,
-            Command::BCD(_, x) => {
+            Instruction::FontChar(_, x) => self.idx_reg = 0x100 + (self.registers[x] & 0x0F) as usize,
+            Instruction::BCD(_, x) => {
                 let mut a = self.registers[x];
                 for i in 0..3 {
                     self.mem.write(self.idx_reg + i, &[a % 10]).unwrap();
                     a /= 10;
                 }
             }
-            Command::StoreMem(_, x) => self.mem.write(self.idx_reg, &self.registers[0..=x]).unwrap(),
-            Command::ReadMem(_, x) => {
+            Instruction::StoreMem(_, x) => self.mem.write(self.idx_reg, &self.registers[0..=x]).unwrap(),
+            Instruction::ReadMem(_, x) => {
                 self.registers[0..=x].copy_from_slice(&self.mem.read(self.idx_reg, x + 1).unwrap())
             }
-            _ => (),
+            Instruction::Nop(_) => (),
         }
     }
+}
+
+fn try_get_key(timeout: time::Duration) -> Option<KeyCode> {
+    if event::poll(timeout).unwrap() {
+        if let Event::Key(key) = event::read().unwrap() {
+            return Some(key.code);
+        }
+    }
+    None
+}
+
+// TODO: add a cancel handler, kinda like context.WithCancel in Go.
+fn wait_for_key(key: KeyCode) -> io::Result<()> {
+    loop {
+        if let Event::Key(k) = event::read()? {
+            if k.code == key {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Maps a hexadecimal digit (index in the array) to the corresponding keycode.
@@ -281,7 +348,7 @@ const KEY_MAP: [char; 16] = [
 
 #[cfg(test)]
 mod test_emulator {
-    use crate::{split_u16_into_bytes, Command, Emulator, ErrMemory};
+    use crate::{split_u16_into_bytes, Emulator, ErrMemory, Instruction};
     use std::sync::mpsc;
     use std::time;
 
@@ -317,12 +384,12 @@ mod test_emulator {
     #[test]
     fn fetch_and_decode() {
         let (mut emu, instructions, instructions_in_bytes) = init();
-        let test_commands: Vec<Command> = instructions.iter().map(|x| Command::from(*x)).collect();
+        let test_instructions: Vec<Instruction> = instructions.iter().map(|x| Instruction::from(*x)).collect();
 
         emu.load(&instructions_in_bytes[..]).unwrap();
 
-        for cmd in test_commands {
-            assert_eq!(emu.fetch_next_and_decode().unwrap(), cmd);
+        for i in test_instructions {
+            assert_eq!(emu.fetch_next_and_decode().unwrap(), i);
         }
     }
 }
@@ -358,7 +425,7 @@ fn test_split_u8_into_bits() {
 }
 
 #[derive(Debug, PartialEq)]
-enum Command {
+enum Instruction {
     Nop(u16),   // just to be safe
     Clear(u16), // 0x00E0
 
@@ -402,41 +469,41 @@ enum Command {
     ReadMem(u16, usize),  // 0xFX65
 }
 
-impl ToString for Command {
+impl ToString for Instruction {
     fn to_string(&self) -> String {
         match self {
-            Command::Nop(i) => format!("{:#06x} nop", i),
-            Command::Clear(i) => format!("{:#06x} clear screen", i),
-            Command::Jump(i, addr) => format!("{:#06x} jump to {:#05x}", i, addr),
-            Command::SubroutinePush(i, addr) => format!("{:#06x} subroutine at {:#06x}", i, addr),
-            Command::SubroutinePop(i) => format!("{:#06x} return from subroutine", i),
-            Command::SkipEqI(i, x, y) => format!("{:#06x} skip if V{} == {:#04x}", i, x, y),
-            Command::SkipNeqI(i, x, y) => format!("{:#06x} skip if V{} != {:#04x}", i, x, y),
-            Command::SkipEq(i, x, y) => format!("{:#06x} skip if V{} == V{}", i, x, y),
-            Command::SkipNeq(i, x, y) => format!("{:#06x} skip if V{} != V{}", i, x, y),
-            Command::Set(i, x, y) => format!("{:#06x} set V{} = {:#04x}", i, x, y),
-            Command::Add(i, x, nn) => format!("{:#06x} add {:#04x} to V{}", i, nn, x),
-            Command::Arithmetic(i, op) => format!("{:#06x} {}", i, op),
-            Command::SetIdx(i, addr) => format!("{:#06x} set I to {:#05x}", i, addr),
-            Command::JumpX(i, addr) => format!("{:#06x} jump to {:#05x} + V0", i, addr),
-            Command::Random(i, x, nn) => format!("{:#06x} set V{} to random with mask {:#04x}", i, x, nn),
-            Command::Display {
+            Instruction::Nop(i) => format!("{:#06x} nop", i),
+            Instruction::Clear(i) => format!("{:#06x} clear screen", i),
+            Instruction::Jump(i, addr) => format!("{:#06x} jump to {:#05x}", i, addr),
+            Instruction::SubroutinePush(i, addr) => format!("{:#06x} subroutine at {:#06x}", i, addr),
+            Instruction::SubroutinePop(i) => format!("{:#06x} return from subroutine", i),
+            Instruction::SkipEqI(i, x, y) => format!("{:#06x} skip if V{} == {:#04x}", i, x, y),
+            Instruction::SkipNeqI(i, x, y) => format!("{:#06x} skip if V{} != {:#04x}", i, x, y),
+            Instruction::SkipEq(i, x, y) => format!("{:#06x} skip if V{} == V{}", i, x, y),
+            Instruction::SkipNeq(i, x, y) => format!("{:#06x} skip if V{} != V{}", i, x, y),
+            Instruction::Set(i, x, y) => format!("{:#06x} set V{} = {:#04x}", i, x, y),
+            Instruction::Add(i, x, nn) => format!("{:#06x} add {:#04x} to V{}", i, nn, x),
+            Instruction::Arithmetic(i, op) => format!("{:#06x} {}", i, op),
+            Instruction::SetIdx(i, addr) => format!("{:#06x} set I to {:#05x}", i, addr),
+            Instruction::JumpX(i, addr) => format!("{:#06x} jump to {:#05x} + V0", i, addr),
+            Instruction::Random(i, x, nn) => format!("{:#06x} set V{} to random with mask {:#04x}", i, x, nn),
+            Instruction::Display {
                 instruction,
                 x,
                 y,
                 height,
-            } => format!("{:#06x} display 8x{} at ({}, {})", instruction, height, x, y),
-            Command::SkipOnKey(i, x) => format!("{:#06x} skip if V{} key pressed", i, x),
-            Command::SkipOffKey(i, x) => format!("{:#06x} skip if V{} key not pressed", i, x),
-            Command::ReadDelay(i, x) => format!("{:#06x} read delay timer into V{}", i, x),
-            Command::SetDelay(i, x) => format!("{:#06x} set delay timer to V{}", i, x),
-            Command::SetSound(i, x) => format!("{:#06x} set sound timer to V{}", i, x),
-            Command::AddIdx(i, x) => format!("{:#06x} add V{} to I", i, x),
-            Command::GetKey(i, x) => format!("{:#06x} wait for key press and store in V{}", i, x),
-            Command::FontChar(i, x) => format!("{:#06x} set I to font sprite for char V{}", i, x),
-            Command::BCD(i, x) => format!("{:#06x} set mem @ I to BCD of V{}", i, x),
-            Command::StoreMem(i, x) => format!("{:#06x} set mem @ I to V0-V{}", i, x),
-            Command::ReadMem(i, x) => format!("{:#06x} read mem @ I to V0-V{}", i, x),
+            } => format!("{:#06x} draw 8-by-{} sprite at (V{}, V{})", instruction, height, x, y),
+            Instruction::SkipOnKey(i, x) => format!("{:#06x} skip if V{} key pressed", i, x),
+            Instruction::SkipOffKey(i, x) => format!("{:#06x} skip if V{} key not pressed", i, x),
+            Instruction::ReadDelay(i, x) => format!("{:#06x} read delay timer into V{}", i, x),
+            Instruction::SetDelay(i, x) => format!("{:#06x} set delay timer to V{}", i, x),
+            Instruction::SetSound(i, x) => format!("{:#06x} set sound timer to V{}", i, x),
+            Instruction::AddIdx(i, x) => format!("{:#06x} add V{} to I", i, x),
+            Instruction::GetKey(i, x) => format!("{:#06x} wait for key press and store in V{}", i, x),
+            Instruction::FontChar(i, x) => format!("{:#06x} set I to font sprite for char V{}", i, x),
+            Instruction::BCD(i, x) => format!("{:#06x} set mem @ I to BCD of V{}", i, x),
+            Instruction::StoreMem(i, x) => format!("{:#06x} set mem @ I to V0-V{}", i, x),
+            Instruction::ReadMem(i, x) => format!("{:#06x} read mem @ I to V0-V{}", i, x),
         }
     }
 }
@@ -468,7 +535,7 @@ impl fmt::Display for Operation {
     }
 }
 
-impl Command {
+impl Instruction {
     fn from(i: u16) -> Self {
         let opcode = (i & 0xF000) >> 12;
         let x = ((i & 0x0F00) >> 8) as usize;
@@ -479,113 +546,113 @@ impl Command {
 
         match opcode {
             0x0 => match nnn {
-                0x0E0 => Command::Clear(i),
-                0x0EE => Command::SubroutinePop(i),
-                _ => Command::Nop(i),
+                0x0E0 => Instruction::Clear(i),
+                0x0EE => Instruction::SubroutinePop(i),
+                _ => Instruction::Nop(i),
             },
-            0x1 => Command::Jump(i, nnn),
-            0x2 => Command::SubroutinePush(i, nnn),
-            0x3 => Command::SkipEqI(i, x, nn),
-            0x4 => Command::SkipNeqI(i, x, nn),
-            0x5 => Command::SkipEq(i, x, y),
-            0x6 => Command::Set(i, x, nn),
-            0x7 => Command::Add(i, x, nn),
+            0x1 => Instruction::Jump(i, nnn),
+            0x2 => Instruction::SubroutinePush(i, nnn),
+            0x3 => Instruction::SkipEqI(i, x, nn),
+            0x4 => Instruction::SkipNeqI(i, x, nn),
+            0x5 => Instruction::SkipEq(i, x, y),
+            0x6 => Instruction::Set(i, x, nn),
+            0x7 => Instruction::Add(i, x, nn),
             0x8 => match n {
-                0x0 => Command::Arithmetic(i, Operation::Set(x, y)),
-                0x1 => Command::Arithmetic(i, Operation::Or(x, y)),
-                0x2 => Command::Arithmetic(i, Operation::And(x, y)),
-                0x3 => Command::Arithmetic(i, Operation::Xor(x, y)),
-                0x4 => Command::Arithmetic(i, Operation::Add(x, y)),
-                0x5 => Command::Arithmetic(i, Operation::Sub(x, y)),
-                0x7 => Command::Arithmetic(i, Operation::Sub(y, x)),
-                0x6 => Command::Arithmetic(i, Operation::ShiftR(x, y)),
-                0xE => Command::Arithmetic(i, Operation::ShiftL(x, y)),
-                _ => Command::Nop(i),
+                0x0 => Instruction::Arithmetic(i, Operation::Set(x, y)),
+                0x1 => Instruction::Arithmetic(i, Operation::Or(x, y)),
+                0x2 => Instruction::Arithmetic(i, Operation::And(x, y)),
+                0x3 => Instruction::Arithmetic(i, Operation::Xor(x, y)),
+                0x4 => Instruction::Arithmetic(i, Operation::Add(x, y)),
+                0x5 => Instruction::Arithmetic(i, Operation::Sub(x, y)),
+                0x7 => Instruction::Arithmetic(i, Operation::Sub(y, x)),
+                0x6 => Instruction::Arithmetic(i, Operation::ShiftR(x, y)),
+                0xE => Instruction::Arithmetic(i, Operation::ShiftL(x, y)),
+                _ => Instruction::Nop(i),
             },
-            0x9 => Command::SkipNeq(i, x, y),
-            0xA => Command::SetIdx(i, nnn),
-            0xB => Command::JumpX(i, nnn),
-            0xC => Command::Random(i, x, nn),
-            0xD => Command::Display {
+            0x9 => Instruction::SkipNeq(i, x, y),
+            0xA => Instruction::SetIdx(i, nnn),
+            0xB => Instruction::JumpX(i, nnn),
+            0xC => Instruction::Random(i, x, nn),
+            0xD => Instruction::Display {
                 instruction: i,
                 x,
                 y,
                 height: n,
             },
             0xE => match nn {
-                0x9E => Command::SkipOnKey(i, x),
-                0xA1 => Command::SkipOffKey(i, x),
-                _ => Command::Nop(i),
+                0x9E => Instruction::SkipOnKey(i, x),
+                0xA1 => Instruction::SkipOffKey(i, x),
+                _ => Instruction::Nop(i),
             },
             0xF => match nn {
-                0x07 => Command::ReadDelay(i, x),
-                0x15 => Command::SetDelay(i, x),
-                0x18 => Command::SetSound(i, x),
-                0x1E => Command::AddIdx(i, x),
-                0x0A => Command::GetKey(i, x),
-                0x29 => Command::FontChar(i, x),
-                0x33 => Command::BCD(i, x),
-                0x55 => Command::StoreMem(i, x),
-                0x65 => Command::ReadMem(i, x),
-                _ => Command::Nop(i),
+                0x07 => Instruction::ReadDelay(i, x),
+                0x15 => Instruction::SetDelay(i, x),
+                0x18 => Instruction::SetSound(i, x),
+                0x1E => Instruction::AddIdx(i, x),
+                0x0A => Instruction::GetKey(i, x),
+                0x29 => Instruction::FontChar(i, x),
+                0x33 => Instruction::BCD(i, x),
+                0x55 => Instruction::StoreMem(i, x),
+                0x65 => Instruction::ReadMem(i, x),
+                _ => Instruction::Nop(i),
             },
-            _ => Command::Nop(i),
+            _ => Instruction::Nop(i),
         }
     }
 }
 
 #[cfg(test)]
-mod test_command {
-    use crate::{Command, Operation};
+mod test_instruction {
+    use crate::{Instruction, Operation};
 
     #[test]
     fn decode() {
         let tests = vec![
-            (0x00e0, Command::Clear(0x00e0)),
-            (0x1abc, Command::Jump(0x1abc, 0xabc)),
-            (0x2abc, Command::SubroutinePush(0x2abc, 0xabc)),
-            (0x00ee, Command::SubroutinePop(0x00ee)),
-            (0x3abc, Command::SkipEqI(0x3abc, 0xa, 0xbc)),
-            (0x4abc, Command::SkipNeqI(0x4abc, 0xa, 0xbc)),
-            (0x5ab0, Command::SkipEq(0x5ab0, 0xa, 0xb)),
-            (0x9ab0, Command::SkipNeq(0x9ab0, 0xa, 0xb)),
-            (0x6abc, Command::Set(0x6abc, 0xa, 0xbc)),
-            (0x7abc, Command::Add(0x7abc, 0xa, 0xbc)),
-            (0x8ab0, Command::Arithmetic(0x8ab0, Operation::Set(0xa, 0xb))),
-            (0x8ab1, Command::Arithmetic(0x8ab1, Operation::Or(0xa, 0xb))),
-            (0x8ab2, Command::Arithmetic(0x8ab2, Operation::And(0xa, 0xb))),
-            (0x8ab3, Command::Arithmetic(0x8ab3, Operation::Xor(0xA, 0xB))),
-            (0x8ab4, Command::Arithmetic(0x8ab4, Operation::Add(0xA, 0xB))),
-            (0x8ab5, Command::Arithmetic(0x8ab5, Operation::Sub(0xA, 0xB))),
-            (0x8ab7, Command::Arithmetic(0x8ab7, Operation::Sub(0xB, 0xA))),
-            (0x8ab6, Command::Arithmetic(0x8ab6, Operation::ShiftR(0xA, 0xB))),
-            (0x8abe, Command::Arithmetic(0x8abe, Operation::ShiftL(0xA, 0xB))),
-            (0xaabc, Command::SetIdx(0xaabc, 0xABC)),
-            (0xbabc, Command::JumpX(0xbabc, 0xABC)),
-            (0xcabc, Command::Random(0xcabc, 0xA, 0xBC)),
+            (0x00e0, Instruction::Clear(0x00e0)),
+            (0x1abc, Instruction::Jump(0x1abc, 0xabc)),
+            (0x2abc, Instruction::SubroutinePush(0x2abc, 0xabc)),
+            (0x00ee, Instruction::SubroutinePop(0x00ee)),
+            (0x3abc, Instruction::SkipEqI(0x3abc, 0xa, 0xbc)),
+            (0x4abc, Instruction::SkipNeqI(0x4abc, 0xa, 0xbc)),
+            (0x5ab0, Instruction::SkipEq(0x5ab0, 0xa, 0xb)),
+            (0x9ab0, Instruction::SkipNeq(0x9ab0, 0xa, 0xb)),
+            (0x6abc, Instruction::Set(0x6abc, 0xa, 0xbc)),
+            (0x7abc, Instruction::Add(0x7abc, 0xa, 0xbc)),
+            (0x8ab0, Instruction::Arithmetic(0x8ab0, Operation::Set(0xa, 0xb))),
+            (0x8ab1, Instruction::Arithmetic(0x8ab1, Operation::Or(0xa, 0xb))),
+            (0x8ab2, Instruction::Arithmetic(0x8ab2, Operation::And(0xa, 0xb))),
+            (0x8ab3, Instruction::Arithmetic(0x8ab3, Operation::Xor(0xA, 0xB))),
+            (0x8ab4, Instruction::Arithmetic(0x8ab4, Operation::Add(0xA, 0xB))),
+            (0x8ab5, Instruction::Arithmetic(0x8ab5, Operation::Sub(0xA, 0xB))),
+            (0x8ab7, Instruction::Arithmetic(0x8ab7, Operation::Sub(0xB, 0xA))),
+            (0x8ab6, Instruction::Arithmetic(0x8ab6, Operation::ShiftR(0xA, 0xB))),
+            (0x8abe, Instruction::Arithmetic(0x8abe, Operation::ShiftL(0xA, 0xB))),
+            (0xaabc, Instruction::SetIdx(0xaabc, 0xABC)),
+            (0xbabc, Instruction::JumpX(0xbabc, 0xABC)),
+            (0xcabc, Instruction::Random(0xcabc, 0xA, 0xBC)),
             (
                 0xdabc,
-                Command::Display {
+                Instruction::Display {
                     instruction: 0xdabc,
                     x: 0xA,
                     y: 0xB,
                     height: 0xC,
                 },
             ),
-            (0xea9e, Command::SkipOnKey(0xea9e, 0xA)),
-            (0xeaa1, Command::SkipOffKey(0xeaa1, 0xA)),
-            (0xfa07, Command::ReadDelay(0xfa07, 0xA)),
-            (0xfa15, Command::SetDelay(0xfa15, 0xA)),
-            (0xfa18, Command::SetSound(0xfa18, 0xA)),
-            (0xfa1e, Command::AddIdx(0xfa1e, 0xA)),
-            (0xfa0a, Command::GetKey(0xfa0a, 0xA)),
-            (0xfa29, Command::FontChar(0xfa29, 0xA)),
-            (0xfa33, Command::BCD(0xfa33, 0xA)),
-            (0xfa55, Command::StoreMem(0xfa55, 0xA)),
-            (0xfa65, Command::ReadMem(0xfa65, 0xA)),
+            (0xea9e, Instruction::SkipOnKey(0xea9e, 0xA)),
+            (0xeaa1, Instruction::SkipOffKey(0xeaa1, 0xA)),
+            (0xfa07, Instruction::ReadDelay(0xfa07, 0xA)),
+            (0xfa15, Instruction::SetDelay(0xfa15, 0xA)),
+            (0xfa18, Instruction::SetSound(0xfa18, 0xA)),
+            (0xfa1e, Instruction::AddIdx(0xfa1e, 0xA)),
+            (0xfa0a, Instruction::GetKey(0xfa0a, 0xA)),
+            (0xfa29, Instruction::FontChar(0xfa29, 0xA)),
+            (0xfa33, Instruction::BCD(0xfa33, 0xA)),
+            (0xfa55, Instruction::StoreMem(0xfa55, 0xA)),
+            (0xfa65, Instruction::ReadMem(0xfa65, 0xA)),
         ];
         for test in tests {
-            assert_eq!(Command::from(test.0), test.1);
+            assert_eq!(Instruction::from(test.0), test.1);
         }
     }
 }
@@ -850,12 +917,12 @@ struct UI {
     updates: mpsc::Receiver<Update>,
 
     /// All instructions of the program.
-    instructions: Vec<Command>,
+    instructions: Vec<Instruction>,
     current_instruction: usize,
 }
 
 impl UI {
-    fn new(rx: mpsc::Receiver<Update>, pixels: Pixels, instructions: Vec<Command>) -> Self {
+    fn new(rx: mpsc::Receiver<Update>, pixels: Pixels, instructions: Vec<Instruction>) -> Self {
         let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend).unwrap();
@@ -896,7 +963,7 @@ impl UI {
 fn ui<B: Backend>(
     f: &mut Frame<B>,
     pixels: Arc<Mutex<[bool; 64 * 32]>>,
-    instructions: &[Command],
+    instructions: &[Instruction],
     current_instruction: usize,
 ) {
     // Split screen into top and bottom halves.
