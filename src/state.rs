@@ -13,6 +13,7 @@ pub fn normal(e: &mut Emulator) -> Option<StateFn> {
                 e.updates_tx.send(AppUpdate::Exit).unwrap();
                 return None;
             }
+            KeyCode::Char('i') => return Some(StateFn(debug)),
             _ => {}
         },
     }
@@ -30,12 +31,33 @@ fn paused(e: &mut Emulator) -> Option<StateFn> {
                 e.updates_tx.send(AppUpdate::Exit).unwrap();
                 return None;
             }
+            KeyCode::Char('i') => return Some(StateFn(debug)),
             _ => Some(StateFn(paused)),
         },
     }
 }
 
-fn try_get_key(timeout: time::Duration) -> Option<KeyCode> {
+fn debug(e: &mut Emulator) -> Option<StateFn> {
+    match try_get_key(POLL_TIMEOUT) {
+        None => Some(StateFn(debug)),
+        Some(key) => match key {
+            KeyCode::Char('p') => return Some(StateFn(paused)),
+            KeyCode::Char('o') => {
+                e.updates_tx.send(AppUpdate::Exit).unwrap();
+                return None;
+            }
+            KeyCode::Char('i') => return Some(StateFn(normal)),
+            KeyCode::Enter => {
+                let i = e.fetch_next_and_decode().expect("could not decode next instruction");
+                exec(i, e).expect("failed while executing instruction");
+                Some(StateFn(debug))
+            }
+            _ => return Some(StateFn(debug)),
+        },
+    }
+}
+
+pub fn try_get_key(timeout: time::Duration) -> Option<KeyCode> {
     if event::poll(timeout).unwrap() {
         if let Event::Key(key) = event::read().unwrap() {
             return Some(key.code);
