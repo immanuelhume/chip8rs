@@ -108,7 +108,7 @@ impl App {
         {
             let widget = Canvas::default()
                 .block(Block::default().borders(Borders::ALL).title("CHIP-8"))
-                .marker(Marker::Block)
+                // .marker(Marker::Dot)
                 .x_bounds([0.0, 64.0])
                 .y_bounds([0.0, 32.0])
                 .paint(|ctx| {
@@ -172,7 +172,9 @@ impl App {
                 .map(|x| {
                     ListItem::new(Spans::from(vec![
                         Span::raw(format!("V{:<3X}", x.0)),
-                        Span::raw(format!("{:#010b} ({:#04x})", x.1, x.1)),
+                        Span::styled(format!("{:#010b}", x.1), Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" "),
+                        Span::raw(format!("({:#04x})", x.1)),
                     ]))
                 })
                 .collect();

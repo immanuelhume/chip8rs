@@ -503,7 +503,7 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
         FontChar(_, x) => e.i = FONT_IDX + (e.registers.lock()?[x as usize] & 0x0F) as u16,
         BCD(_, x) => {
             let mut a = e.registers.lock()?[x as usize];
-            for i in 0..3 {
+            for i in (0..3).rev() {
                 e.mem.write(e.i + i, &[a % 10]);
                 a /= 10;
             }
