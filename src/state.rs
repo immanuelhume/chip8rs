@@ -1,10 +1,13 @@
-use crate::{exec, AppUpdate, Emulator, POLL_TIMEOUT};
+use crate::{exec, AppUpdate, EmuState, Emulator, POLL_TIMEOUT};
 use crossterm::event::{self, Event, KeyCode};
 use std::time;
 
 pub struct StateFn(pub fn(&mut Emulator) -> Option<StateFn>);
 
 pub fn normal(e: &mut Emulator) -> Option<StateFn> {
+    e.updates_tx
+        .send(AppUpdate::State(EmuState::Normal))
+        .expect("could not update emulator state to normal");
     match try_get_key(POLL_TIMEOUT) {
         None => {}
         Some(key) => match key {
@@ -23,6 +26,10 @@ pub fn normal(e: &mut Emulator) -> Option<StateFn> {
 }
 
 fn paused(e: &mut Emulator) -> Option<StateFn> {
+    e.updates_tx
+        .send(AppUpdate::State(EmuState::Paused))
+        .expect("could not update emulator state to paused");
+
     match try_get_key(POLL_TIMEOUT) {
         None => Some(StateFn(paused)),
         Some(key) => match key {
@@ -38,6 +45,10 @@ fn paused(e: &mut Emulator) -> Option<StateFn> {
 }
 
 fn debug(e: &mut Emulator) -> Option<StateFn> {
+    e.updates_tx
+        .send(AppUpdate::State(EmuState::Debug))
+        .expect("could not update emulator state to debug");
+
     match try_get_key(POLL_TIMEOUT) {
         None => Some(StateFn(debug)),
         Some(key) => match key {

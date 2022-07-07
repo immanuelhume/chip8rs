@@ -157,6 +157,7 @@ impl Emulator {
 pub enum AppUpdate {
     Exit,
     PC(u16),
+    State(EmuState),
 }
 
 impl std::error::Error for AppUpdate {}
@@ -165,6 +166,24 @@ impl fmt::Display for AppUpdate {
         match self {
             AppUpdate::Exit => write!(f, "exit emulator"),
             AppUpdate::PC(pc) => write!(f, "new pc: {}", pc),
+            AppUpdate::State(state) => write!(f, "new state: {:?}", state),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum EmuState {
+    Normal,
+    Paused,
+    Debug,
+}
+
+impl fmt::Display for EmuState {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            EmuState::Normal => write!(f, "normal"),
+            EmuState::Paused => write!(f, "paused"),
+            EmuState::Debug => write!(f, "debug"),
         }
     }
 }
