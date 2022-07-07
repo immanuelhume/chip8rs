@@ -369,41 +369,42 @@ mod test_array_mem {
 
 /// Executes a single instruction.
 pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::Error + '_>> {
+    use Instruction::*;
     match i {
-        Instruction::Clear(_) => e.pixels.lock()?.clear(),
-        Instruction::Jump(_, addr) => e.pc = addr,
-        Instruction::SubroutinePush(_, addr) => {
+        Clear(_) => e.pixels.lock()?.clear(),
+        Jump(_, addr) => e.pc = addr,
+        SubroutinePush(_, addr) => {
             let mut stack = e.stack.lock()?;
             stack.push(e.pc);
             e.pc = addr;
         }
-        Instruction::SubroutinePop(_) => {
+        SubroutinePop(_) => {
             let mut stack = e.stack.lock()?;
             e.pc = stack.pop().unwrap();
         }
-        Instruction::SkipEqI(_, reg, val) => {
+        SkipEqI(_, reg, val) => {
             if e.registers.lock()?[reg as usize] == val {
                 e.pc += 2;
             }
         }
-        Instruction::SkipNeqI(_, reg, val) => {
+        SkipNeqI(_, reg, val) => {
             if e.registers.lock()?[reg as usize] != val {
                 e.pc += 2;
             }
         }
-        Instruction::SkipEq(_, reg1, reg2) => {
+        SkipEq(_, reg1, reg2) => {
             let registers = e.registers.lock()?;
             if registers[reg1 as usize] == registers[reg2 as usize] {
                 e.pc += 2;
             }
         }
-        Instruction::SkipNeq(_, reg1, reg2) => {
+        SkipNeq(_, reg1, reg2) => {
             let registers = e.registers.lock()?;
             if registers[reg1 as usize] != registers[reg2 as usize] {
                 e.pc += 2;
             }
         }
-        Instruction::Arithmetic(_, op) => {
+        Arithmetic(_, op) => {
             let mut registers = e.registers.lock()?;
             match op {
                 Operation::Set(x, y) => registers[x as usize] = registers[y as usize],
@@ -434,15 +435,15 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
                 }
             }
         }
-        Instruction::Set(_, reg, val) => e.registers.lock()?[reg as usize] = val,
-        Instruction::Add(_, reg, val) => {
+        Set(_, reg, val) => e.registers.lock()?[reg as usize] = val,
+        Add(_, reg, val) => {
             let mut registers = e.registers.lock()?;
             registers[reg as usize] = registers[reg as usize].wrapping_add(val);
         }
-        Instruction::SetIdx(_, v) => e.i = v,
-        Instruction::JumpX(_, addr) => e.pc = e.registers.lock()?[0] as u16 + addr,
-        Instruction::Random(_, reg, val) => e.registers.lock()?[reg as usize] = rand::random::<u8>() & val,
-        Instruction::Display { x, y, n, .. } => {
+        SetIdx(_, v) => e.i = v,
+        JumpX(_, addr) => e.pc = e.registers.lock()?[0] as u16 + addr,
+        Random(_, reg, val) => e.registers.lock()?[reg as usize] = rand::random::<u8>() & val,
+        Display { x, y, n, .. } => {
             let mut registers = e.registers.lock()?;
             let i = registers[y as usize];
             let j = registers[x as usize];
@@ -451,7 +452,7 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
             let is_px_turned_off = e.pixels.lock()?.draw_sprite(i as usize, j as usize, sprite);
             registers[0xF] = if is_px_turned_off { 1 } else { 0 };
         }
-        Instruction::SkipOnKey(_, x) => {
+        SkipOnKey(_, x) => {
             if event::poll(POLL_TIMEOUT)? {
                 if let Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Char(KEY_MAP[e.registers.lock()?[x as usize] as usize]) {
@@ -460,7 +461,7 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
                 }
             }
         }
-        Instruction::SkipOffKey(_, x) => {
+        SkipOffKey(_, x) => {
             if event::poll(POLL_TIMEOUT)? {
                 if let Event::Key(key) = event::read()? {
                     if key.code == KeyCode::Char(KEY_MAP[e.registers.lock()?[x as usize] as usize]) {
@@ -470,10 +471,10 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
             }
             e.pc += 2;
         }
-        Instruction::ReadDelay(_, x) => e.registers.lock()?[x as usize] = e.delay_timer.get(),
-        Instruction::SetDelay(_, x) => e.delay_timer.set(e.registers.lock()?[x as usize]),
-        Instruction::SetSound(_, x) => e.sound_timer.set(e.registers.lock()?[x as usize]),
-        Instruction::AddIdx(_, x) => {
+        ReadDelay(_, x) => e.registers.lock()?[x as usize] = e.delay_timer.get(),
+        SetDelay(_, x) => e.delay_timer.set(e.registers.lock()?[x as usize]),
+        SetSound(_, x) => e.sound_timer.set(e.registers.lock()?[x as usize]),
+        AddIdx(_, x) => {
             let a = e.i;
             let mut registers = e.registers.lock()?;
             let sum = a + registers[x as usize] as u16;
@@ -482,7 +483,7 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
             }
             e.i = sum;
         }
-        Instruction::GetKey(_, x) => loop {
+        GetKey(_, x) => loop {
             if let Event::Key(key) = event::read()? {
                 if let KeyCode::Char(c) = key.code {
                     match KEY_MAP.iter().position(|&x| x == c) {
@@ -499,19 +500,17 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
                 }
             }
         },
-        Instruction::FontChar(_, x) => e.i = FONT_IDX + (e.registers.lock()?[x as usize] & 0x0F) as u16,
-        Instruction::BCD(_, x) => {
+        FontChar(_, x) => e.i = FONT_IDX + (e.registers.lock()?[x as usize] & 0x0F) as u16,
+        BCD(_, x) => {
             let mut a = e.registers.lock()?[x as usize];
             for i in 0..3 {
                 e.mem.write(e.i + i, &[a % 10]);
                 a /= 10;
             }
         }
-        Instruction::StoreMem(_, x) => e.mem.write(e.i, &e.registers.lock()?[0..=x as usize]),
-        Instruction::ReadMem(_, x) => {
-            e.registers.lock()?[0..=x as usize].copy_from_slice(e.mem.read(e.i, x as u16 + 1))
-        }
-        Instruction::Nop(_) => (),
+        StoreMem(_, x) => e.mem.write(e.i, &e.registers.lock()?[0..=x as usize]),
+        ReadMem(_, x) => e.registers.lock()?[0..=x as usize].copy_from_slice(e.mem.read(e.i, x as u16 + 1)),
+        Nop(_) => (),
     }
 
     Ok(())
