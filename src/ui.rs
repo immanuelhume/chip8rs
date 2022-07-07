@@ -81,18 +81,18 @@ impl App {
         let bot = screen[1];
 
         // Split each half into a left and right portion.
-        let top = Layout::default()
+        let y01x0123 = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
             .split(top);
-        let bot = Layout::default()
+        let y23x0123 = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
             .split(bot);
-        let top_right = Layout::default()
+        let y01x01 = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-            .split(top[1]);
+            .split(y01x0123[0]);
 
         // Create the game screen.
         {
@@ -119,7 +119,7 @@ impl App {
                         color: Color::White,
                     })
                 });
-            f.render_widget(widget, top[0]);
+            f.render_widget(widget, y01x0123[1]);
         }
 
         // Create a list of instructions.
@@ -127,7 +127,14 @@ impl App {
             let instructions: Vec<ListItem> = self
                 .instructions
                 .iter()
-                .map(|i| ListItem::new(Spans::from(vec![Span::raw(i.to_string())])))
+                .enumerate()
+                .map(|i| {
+                    ListItem::new(Spans::from(vec![
+                        Span::raw(format!("{:#05x}", i.0 * 2 + 0x200)),
+                        Span::raw(" "),
+                        Span::raw(i.1.to_string()),
+                    ]))
+                })
                 .collect();
 
             let mut state = ListState::default();
@@ -142,7 +149,25 @@ impl App {
                         .bg(Color::White),
                 )
                 .highlight_symbol(">");
-            f.render_stateful_widget(widget, bot[0], &mut state);
+            f.render_stateful_widget(widget, y23x0123[1], &mut state);
+        }
+
+        {
+            let registers: Vec<ListItem> = self
+                .registers
+                .lock()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|x| {
+                    ListItem::new(Spans::from(vec![
+                        Span::raw(format!("V{:<3X}", x.0)),
+                        Span::raw(format!("{:#010b} ({:#04x})", x.1, x.1)),
+                    ]))
+                })
+                .collect();
+            let widget = List::new(registers).block(Block::default().borders(Borders::ALL).title("Registers"));
+            f.render_widget(widget, y01x01[0]);
         }
     }
 }

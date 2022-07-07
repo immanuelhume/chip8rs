@@ -4,8 +4,8 @@ use instruction::{Instruction, Operation};
 use std::io::{self, Read};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time;
 use std::{env, thread};
+use std::{fmt, time};
 use tui::backend::CrosstermBackend;
 use tui::Terminal;
 
@@ -37,7 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let c = (a as u16) << 8 | b as u16;
                 Instruction::from(c)
             } else {
-                panic!("wrong number of bytes read from rom")
+                // panic!("wrong number of bytes read from rom")
+                Instruction::Nop(0000)
             }
         })
         .collect();
@@ -152,9 +153,20 @@ impl Emulator {
 /// Some type of update which the UI must know about. Note that for the most
 /// part, the UI shares state with the emulator via mutexes. But we can also use
 /// these updates if it is more ergonomic.
+#[derive(Debug)]
 pub enum AppUpdate {
     Exit,
     PC(u16),
+}
+
+impl std::error::Error for AppUpdate {}
+impl fmt::Display for AppUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            AppUpdate::Exit => write!(f, "exit emulator"),
+            AppUpdate::PC(pc) => write!(f, "new pc: {}", pc),
+        }
+    }
 }
 
 pub struct Pixels([bool; 64 * 32]);
@@ -423,7 +435,10 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
             }
         }
         Instruction::Set(_, reg, val) => e.registers.lock()?[reg as usize] = val,
-        Instruction::Add(_, reg, val) => e.registers.lock()?[reg as usize] += val,
+        Instruction::Add(_, reg, val) => {
+            let mut registers = e.registers.lock()?;
+            registers[reg as usize] = registers[reg as usize].wrapping_add(val);
+        }
         Instruction::SetIdx(_, v) => e.i = v,
         Instruction::JumpX(_, addr) => e.pc = e.registers.lock()?[0] as u16 + addr,
         Instruction::Random(_, reg, val) => e.registers.lock()?[reg as usize] = rand::random::<u8>() & val,
@@ -475,7 +490,11 @@ pub fn exec(i: Instruction, e: &mut Emulator) -> Result<(), Box<dyn std::error::
                             e.registers.lock()?[x as usize] = i as u8;
                             break;
                         }
-                        _ => (),
+                        None => {
+                            if c == 'o' {
+                                return Err(Box::new(AppUpdate::Exit));
+                            }
+                        }
                     }
                 }
             }

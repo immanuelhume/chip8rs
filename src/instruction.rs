@@ -111,30 +111,30 @@ impl ToString for Instruction {
             Instruction::Jump(i, addr) => format!("{:#06x} jump to {:#05x}", i, addr),
             Instruction::SubroutinePush(i, addr) => format!("{:#06x} subroutine at {:#06x}", i, addr),
             Instruction::SubroutinePop(i) => format!("{:#06x} return from subroutine", i),
-            Instruction::SkipEqI(i, x, y) => format!("{:#06x} skip if V{} == {:#04x}", i, x, y),
-            Instruction::SkipNeqI(i, x, y) => format!("{:#06x} skip if V{} != {:#04x}", i, x, y),
-            Instruction::SkipEq(i, x, y) => format!("{:#06x} skip if V{} == V{}", i, x, y),
-            Instruction::SkipNeq(i, x, y) => format!("{:#06x} skip if V{} != V{}", i, x, y),
-            Instruction::Set(i, x, y) => format!("{:#06x} set V{} = {:#04x}", i, x, y),
-            Instruction::Add(i, x, nn) => format!("{:#06x} add {:#04x} to V{}", i, nn, x),
+            Instruction::SkipEqI(i, x, y) => format!("{:#06x} skip if V{:1X} == {:#04x}", i, x, y),
+            Instruction::SkipNeqI(i, x, y) => format!("{:#06x} skip if V{:1X} != {:#04x}", i, x, y),
+            Instruction::SkipEq(i, x, y) => format!("{:#06x} skip if V{:1X} == V{:1X}", i, x, y),
+            Instruction::SkipNeq(i, x, y) => format!("{:#06x} skip if V{:1X} != V{:1X}", i, x, y),
+            Instruction::Set(i, x, y) => format!("{:#06x} set V{:1X} = {:#04x}", i, x, y),
+            Instruction::Add(i, x, nn) => format!("{:#06x} add {:#04x} to V{:1X}", i, nn, x),
             Instruction::Arithmetic(i, op) => format!("{:#06x} {}", i, op),
             Instruction::SetIdx(i, addr) => format!("{:#06x} set I to {:#05x}", i, addr),
             Instruction::JumpX(i, addr) => format!("{:#06x} jump to {:#05x} + V0", i, addr),
-            Instruction::Random(i, x, nn) => format!("{:#06x} set V{} to random with mask {:#04x}", i, x, nn),
+            Instruction::Random(i, x, nn) => format!("{:#06x} set V{:1X} to random with mask {:#04x}", i, x, nn),
             Instruction::Display { i, x, y, n } => {
-                format!("{:#06x} draw 8-by-{} sprite at (V{}, V{})", i, n, x, y)
+                format!("{:#06x} draw 8-by-{} sprite at (V{:1X}, V{:1X})", i, n, x, y)
             }
-            Instruction::SkipOnKey(i, x) => format!("{:#06x} skip if V{} key pressed", i, x),
-            Instruction::SkipOffKey(i, x) => format!("{:#06x} skip if V{} key not pressed", i, x),
-            Instruction::ReadDelay(i, x) => format!("{:#06x} read delay timer into V{}", i, x),
-            Instruction::SetDelay(i, x) => format!("{:#06x} set delay timer to V{}", i, x),
-            Instruction::SetSound(i, x) => format!("{:#06x} set sound timer to V{}", i, x),
-            Instruction::AddIdx(i, x) => format!("{:#06x} add V{} to I", i, x),
-            Instruction::GetKey(i, x) => format!("{:#06x} wait for key press and store in V{}", i, x),
-            Instruction::FontChar(i, x) => format!("{:#06x} set I to font sprite for char V{}", i, x),
-            Instruction::BCD(i, x) => format!("{:#06x} set mem @ I to BCD of V{}", i, x),
-            Instruction::StoreMem(i, x) => format!("{:#06x} set mem @ I to V0-V{}", i, x),
-            Instruction::ReadMem(i, x) => format!("{:#06x} read mem @ I to V0-V{}", i, x),
+            Instruction::SkipOnKey(i, x) => format!("{:#06x} skip if V{:1X} key pressed", i, x),
+            Instruction::SkipOffKey(i, x) => format!("{:#06x} skip if V{:1X} key not pressed", i, x),
+            Instruction::ReadDelay(i, x) => format!("{:#06x} read delay timer into V{:1X}", i, x),
+            Instruction::SetDelay(i, x) => format!("{:#06x} set delay timer to V{:1X}", i, x),
+            Instruction::SetSound(i, x) => format!("{:#06x} set sound timer to V{:1X}", i, x),
+            Instruction::AddIdx(i, x) => format!("{:#06x} add V{:1X} to I", i, x),
+            Instruction::GetKey(i, x) => format!("{:#06x} wait for key press and store in V{:1X}", i, x),
+            Instruction::FontChar(i, x) => format!("{:#06x} set I to font sprite for char V{:1X}", i, x),
+            Instruction::BCD(i, x) => format!("{:#06x} set mem @ I to BCD of V{:1X}", i, x),
+            Instruction::StoreMem(i, x) => format!("{:#06x} set mem @ I to V0-V{:1X}", i, x),
+            Instruction::ReadMem(i, x) => format!("{:#06x} read mem @ I to V0-V{:1X}", i, x),
         }
     }
 }
@@ -162,6 +162,62 @@ impl fmt::Display for Operation {
             Operation::Sub(x, y) => write!(f, "V{} = V{} - V{}", x, x, y),
             Operation::ShiftL(x, y) => write!(f, "V{} = V{} << 1", x, y),
             Operation::ShiftR(x, y) => write!(f, "V{} = V{} >> 1", x, y),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_instruction {
+    use crate::{Instruction, Operation};
+
+    #[test]
+    fn decode() {
+        let tests = vec![
+            (0x00e0, Instruction::Clear(0x00e0)),
+            (0x1abc, Instruction::Jump(0x1abc, 0xabc)),
+            (0x2abc, Instruction::SubroutinePush(0x2abc, 0xabc)),
+            (0x00ee, Instruction::SubroutinePop(0x00ee)),
+            (0x3abc, Instruction::SkipEqI(0x3abc, 0xa, 0xbc)),
+            (0x4abc, Instruction::SkipNeqI(0x4abc, 0xa, 0xbc)),
+            (0x5ab0, Instruction::SkipEq(0x5ab0, 0xa, 0xb)),
+            (0x9ab0, Instruction::SkipNeq(0x9ab0, 0xa, 0xb)),
+            (0x6abc, Instruction::Set(0x6abc, 0xa, 0xbc)),
+            (0x7abc, Instruction::Add(0x7abc, 0xa, 0xbc)),
+            (0x8ab0, Instruction::Arithmetic(0x8ab0, Operation::Set(0xa, 0xb))),
+            (0x8ab1, Instruction::Arithmetic(0x8ab1, Operation::Or(0xa, 0xb))),
+            (0x8ab2, Instruction::Arithmetic(0x8ab2, Operation::And(0xa, 0xb))),
+            (0x8ab3, Instruction::Arithmetic(0x8ab3, Operation::Xor(0xA, 0xb))),
+            (0x8ab4, Instruction::Arithmetic(0x8ab4, Operation::Add(0xa, 0xb))),
+            (0x8ab5, Instruction::Arithmetic(0x8ab5, Operation::Sub(0xa, 0xb))),
+            (0x8ab7, Instruction::Arithmetic(0x8ab7, Operation::Sub(0xb, 0xa))),
+            (0x8ab6, Instruction::Arithmetic(0x8ab6, Operation::ShiftR(0xa, 0xb))),
+            (0x8abe, Instruction::Arithmetic(0x8abe, Operation::ShiftL(0xa, 0xb))),
+            (0xaabc, Instruction::SetIdx(0xaabc, 0xabc)),
+            (0xbabc, Instruction::JumpX(0xbabc, 0xabc)),
+            (0xcabc, Instruction::Random(0xcabc, 0xa, 0xbc)),
+            (
+                0xdabc,
+                Instruction::Display {
+                    i: 0xdabc,
+                    x: 0xa,
+                    y: 0xb,
+                    n: 0xc,
+                },
+            ),
+            (0xea9e, Instruction::SkipOnKey(0xea9e, 0xa)),
+            (0xeaa1, Instruction::SkipOffKey(0xeaa1, 0xa)),
+            (0xfa07, Instruction::ReadDelay(0xfa07, 0xa)),
+            (0xfa15, Instruction::SetDelay(0xfa15, 0xa)),
+            (0xfa18, Instruction::SetSound(0xfa18, 0xa)),
+            (0xfa1e, Instruction::AddIdx(0xfa1e, 0xa)),
+            (0xfa0a, Instruction::GetKey(0xfa0a, 0xa)),
+            (0xfa29, Instruction::FontChar(0xfa29, 0xa)),
+            (0xfa33, Instruction::BCD(0xfa33, 0xa)),
+            (0xfa55, Instruction::StoreMem(0xfa55, 0xa)),
+            (0xfa65, Instruction::ReadMem(0xfa65, 0xa)),
+        ];
+        for test in tests {
+            assert_eq!(Instruction::from(test.0), test.1);
         }
     }
 }
