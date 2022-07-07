@@ -80,19 +80,29 @@ impl App {
         let top = screen[0];
         let bot = screen[1];
 
-        // Split each half into a left and right portion.
-        let y01x0123 = Layout::default()
+        // Split each half into a left, middle, and right portion.
+        let top = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .constraints(
+                [
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(25),
+                ]
+                .as_ref(),
+            )
             .split(top);
-        let y23x0123 = Layout::default()
+        let bot = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
+            .constraints(
+                [
+                    Constraint::Percentage(25),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(25),
+                ]
+                .as_ref(),
+            )
             .split(bot);
-        let y01x01 = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)].as_ref())
-            .split(y01x0123[0]);
 
         // Create the game screen.
         {
@@ -119,7 +129,7 @@ impl App {
                         color: Color::White,
                     })
                 });
-            f.render_widget(widget, y01x0123[1]);
+            f.render_widget(widget, top[1]);
         }
 
         // Create a list of instructions.
@@ -149,7 +159,7 @@ impl App {
                         .bg(Color::White),
                 )
                 .highlight_symbol(">");
-            f.render_stateful_widget(widget, y23x0123[1], &mut state);
+            f.render_stateful_widget(widget, bot[1], &mut state);
         }
 
         {
@@ -167,7 +177,7 @@ impl App {
                 })
                 .collect();
             let widget = List::new(registers).block(Block::default().borders(Borders::ALL).title("Registers"));
-            f.render_widget(widget, y01x01[0]);
+            f.render_widget(widget, bot[0]);
         }
     }
 }
